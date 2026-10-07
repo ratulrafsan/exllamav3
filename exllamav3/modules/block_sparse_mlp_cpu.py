@@ -478,6 +478,11 @@ class BlockSparseMLP_CPU:
                 "moe_cpu_split and moe_cpu_offload are mutually exclusive: the split offloads " \
                 "a slice of every eligible layer's experts, whole-layer offload takes entire " \
                 "layers — pick one"
+        # EXL3_MOE_CPU_SPLIT_DRAFT=0: keep draft/MTP components fully on the GPU (and out of
+        # the EXL3_MOE_CPU_SPLIT_LAYERS count), splitting only the text model's layers
+        if os.environ.get("EXL3_MOE_CPU_SPLIT_DRAFT", "1") == "0" and \
+                getattr(ip, "moe_cpu_component", "text") != "text":
+            split_k = 0
         split_layers = int(os.environ.get("EXL3_MOE_CPU_SPLIT_LAYERS", 0))
         if split_layers and getattr(ip, "moe_cpu_split_assigned", 0) >= split_layers:
             split_k = 0
