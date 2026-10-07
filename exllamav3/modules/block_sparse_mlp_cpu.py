@@ -735,6 +735,15 @@ class BlockSparseMLP_CPU:
             return None, self.cpu_host.submit_issue(
                 self.cpu_layer_idx, y, sel_cpu, routing_weights)
         sel_cpu = self._split_translate(selected_experts)
+        from ..model.moe_cpu_host import TUNING
+        if TUNING.resident_first:
+            # Local patch (exl3_moe_resident_first): defer the streamed issue to
+            # cpu_split_combine, after the GPU-resident experts (see MoeCpuTuning.resident_first).
+            # sel_cpu is this module's reused translate buffer; the next forward of this layer
+            # comes after the combine
+            pre = self.cpu_host.prefill_prepare(self.cpu_layer_idx, y, sel_cpu, routing_weights)
+            if pre is not None:
+                return None, ("deferred", y, sel_cpu, routing_weights, pre)
         return self.cpu_host.submit_prefill(
             self.cpu_layer_idx, y, sel_cpu, routing_weights), None
 
@@ -784,6 +793,11 @@ class BlockSparseMLP_CPU:
         enqueues a flag wait ahead of the readback, so the add consumes the worker's output
         exactly when it is ready). Fused handles add in place straight from the pinned slot
         (or skip the readback entirely for a job with no CPU-resident picks)."""
+        if cpu_pending is not None and isinstance(cpu_pending, tuple) and cpu_pending[0] == "deferred":
+            _, y, sel_cpu, routing_weights, pre = cpu_pending
+            cpu_partial = self.cpu_host.submit_prefill(
+                self.cpu_layer_idx, y, sel_cpu, routing_weights, pre = pre)
+            cpu_pending = None
         if cpu_pending is not None:
             if isinstance(cpu_pending, tuple) and cpu_pending[0] == "fused":
                 f2 = final_hidden_states.view(-1, final_hidden_states.shape[-1])

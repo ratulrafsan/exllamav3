@@ -16,6 +16,9 @@ from ..util.tensor import SeqTensor
 from ..tokenizer import MMEmbedding
 from functools import lru_cache, partial
 from ..util import profile_opt
+import os
+_MERGE_LAST_PAGE = os.environ.get("EXL3_PREFILL_MERGE_LAST_PAGE", "0") != "0"   # local patch
+_NGRAM_LOOKAHEAD = os.environ.get("EXL3_NGRAM_LOOKAHEAD", "1") != "0"        # local patch
 
 
 class NonFiniteLogits(RuntimeError):
@@ -1394,6 +1397,39 @@ class Job:
         return new_pages
 
 
+    def _prefetch_lookahead(self, seq, start: int, end: int, chunk_size: int | None = None):
+        """
+        Local patch (exl3_ngram_lookahead): queue the input-dependent row gathers (PLE n-gram
+        rows, streamed from disk) for this chunk and then for the next one, on the prefetch
+        worker. The model's own prefetch only overlaps a chunk's gather with its first block;
+        the whole prompt is known here, so the next chunk's gather can run during this chunk's
+        forward instead of stalling between chunks. This chunk goes first so the single worker
+        never makes it wait behind the next one. A guess that doesn't match the coming forward
+        (e.g. a cancelled job) is never used and only costs a gather.
+        """
+        if not _NGRAM_LOOKAHEAD or self.embeddings or self.generator.model.loaded_tp:
+            return
+        layers = [m for m in self.generator.model._get_prefetch_layers if hasattr(m, "prefetch_span")]
+        if not layers:
+            return
+        # The next chunk's bounds, by the same rules prefill() applies on its next call
+        total = len(seq.sequence_ids) - 1
+        nxt_start = end
+        nxt_end = min((nxt_start + self.generator.max_chunk_size) // PAGE_SIZE * PAGE_SIZE, total)
+        if chunk_size is not None:
+            nxt_end = min(nxt_end, (nxt_start + chunk_size) // PAGE_SIZE * PAGE_SIZE)
+        if self.generator.recurrent_cache is not None and not _MERGE_LAST_PAGE:
+            last_page_b = total // PAGE_SIZE * PAGE_SIZE
+            if nxt_start < last_page_b <= nxt_end:
+                nxt_end = last_page_b
+        spans = [(start, end)]
+        if nxt_end > nxt_start:
+            spans.append((nxt_start, nxt_end))
+        for a, b in spans:
+            ids = seq.sequence_ids.torch_slice(0, b)
+            for m in layers:
+                m.prefetch_span(ids, a)
+
     def prefill(self, results: list, chunk_size: int | None = None):
         """
         Run prompt prefill chunks for already allocated cache pages.
@@ -1507,8 +1543,13 @@ class Job:
                     progress += best_match
 
             # For recurrent models, do a separate forward pass for the last page to get the latest possible checkpoint
+            # Local patch (exl3_prefill_merge_last_page): with EXL3_PREFILL_MERGE_LAST_PAGE=1 the
+            # partial last page rides along with the chunk before it (no checkpoint on the last
+            # page boundary; the next turn resumes from the previous checkpoint instead). Each
+            # chunk forward costs about the same at any row count when experts stream over PCIe,
+            # so the separate pass costs as much as a full chunk.
             recurrent_last_page = False
-            if self.generator.recurrent_cache is not None:
+            if self.generator.recurrent_cache is not None and not _MERGE_LAST_PAGE:
                 seqlen = len(seq.sequence_ids) - 1
                 last_page_b = seqlen // PAGE_SIZE * PAGE_SIZE
                 if prefill_start < last_page_b <= prefill_end:
@@ -1581,6 +1622,8 @@ class Job:
                     self.alt_rope_freqs, _ = self.generator.model.g_rope.get_mrope_freqs(
                         ids, self.embeddings, ids.shape[-1]
                     )
+
+                self._prefetch_lookahead(seq, prefill_start, prefill_start + prefill_ids.shape[-1], chunk_size)
 
                 params = {
                     "attn_mode": "flash_attn",

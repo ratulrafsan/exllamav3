@@ -586,6 +586,18 @@ class PLELayer(Module):
         history, _, _ = self._state_history(self._prepare_ids(input_ids), params)
         self.ple_embedding.prefetch(history)
 
+    def prefetch_span(self, seq_ids: torch.Tensor, start: int):
+        """
+        Local patch (exl3_ngram_lookahead): stage the n-gram rows for a forward over
+        seq_ids[:, start:] at sequence position `start`, built from the sequence alone. The
+        carried id context at `start` is the last context_len prepared ids before it (eos-padded
+        at the sequence start), exactly what the state slots hold by then, so the history equals
+        the one forward() will build and the lookup takes the staged rows. Lets the generator
+        stage chunk N+1 while chunk N runs.
+        """
+        history = self._history(self._prepare_ids(seq_ids))
+        self.ple_embedding.prefetch(history[:, start:])
+
     @override
     def prepare_for_device(self, x: torch.Tensor, params: dict) -> torch.Tensor:
         # A deferred mHC apply lands before its streams move to another device (as TransformerBlock)
