@@ -417,6 +417,130 @@ def _split_promote_verify(m, t):
                 f"demote verify failed: {key}.{an} (arena)"
 
 
+# --- Saved dynamic placement (local patch) ---
+# A placement file is a named expert frequency profile: per split layer, in checkpoint expert
+# order, the decayed hit counts and which experts were GPU-resident. EXL3_MOE_PLACEMENT_LOAD
+# names one to seed the load-time hot/cold permutation with (in place of the per-model profile
+# in the user cache dir, see save_expert_stats), so its experts start GPU-resident without any
+# swap, and promote-on-miss / the sweeps keep adapting from there. Format 1 (router-order map
+# and hist, written before the permutation existed, so router order = checkpoint order) is
+# still read.
+
+SPLIT_PLACEMENT_FORMAT = 2
+
+
+def _split_placement_read(path):
+    """(meta, {layer key: entry}) of a placement file; entries carry num_experts, gpu_slots and
+    a per-expert seed score in checkpoint order (residents first, by hit count)"""
+    import json
+    with open(path) as f:
+        data = json.load(f)
+    fmt = data.get("format")
+    if fmt not in (1, 2):
+        raise ValueError(f"unsupported placement file format {fmt!r}")
+    layers = {}
+    for key, e in data.get("layers", {}).items():
+        n = e.get("num_experts")
+        if fmt == 1:
+            first = e.get("gpu_slots")
+            resident = [slot < first for slot in e.get("map", [])]
+        else:
+            resident = e.get("resident", [])
+        hist = e.get("hist", [])
+        if len(resident) != n or len(hist) != n:
+            continue
+        top = max(hist, default = 0.0) + 1.0
+        layers[key] = dict(num_experts = n, gpu_slots = e.get("gpu_slots"),
+                           score = [h + (top if r else 0.0) for r, h in zip(resident, hist)])
+    return data.get("meta", {}), layers
+
+
+def _split_placement_seed(module, first):
+    """Seed scores (checkpoint order) for this layer from EXL3_MOE_PLACEMENT_LOAD, or None. The
+    file's outcome is recorded on infer_params, the layer's on the module, for
+    load_split_placement to report"""
+    path = os.environ.get("EXL3_MOE_PLACEMENT_LOAD")
+    if not path or not os.path.isfile(path):
+        return None
+    ip = module.config.infer_params
+    st = getattr(ip, "moe_placement_seed", None)
+    mtime = os.path.getmtime(path)
+    if st is None or st["path"] != path or st["mtime"] != mtime:
+        st = ip.moe_placement_seed = dict(path = path, mtime = mtime, error = None)
+        try:
+            meta, layers = _split_placement_read(path)
+            model = os.path.basename(os.path.normpath(module.config.directory))
+            if meta.get("model", model) != model:
+                raise ValueError(f"placement file was saved for model={meta['model']!r}, not {model!r}")
+            st["layers"] = layers
+        except (OSError, ValueError) as e:
+            st["error"] = str(e)
+            st["layers"] = {}
+    e = st["layers"].get(module.key)
+    if e is None or e["num_experts"] != module.num_experts or e["gpu_slots"] != first:
+        return None
+    module._split_placement_seeded = True
+    return e["score"]
+
+
+def save_split_placement(infer_params, path, meta = None):
+    """Write the current dynamic placement of every split layer to `path` (JSON). Returns
+    the number of layers saved; 0 when no layer uses dynamic placement."""
+    import json
+    reg = getattr(infer_params, "moe_cpu_swap_modules", None)
+    if not reg:
+        return 0
+    for d in sorted({m.device.index for m in reg if m.device is not None}):
+        torch.cuda.synchronize(d)
+    layers = {}
+    for m in reg:
+        if m._split_map is None or m._split_hist is None:
+            continue
+        E, first = m.num_experts, m.cpu_split_first
+        perm = m._split_perm or list(range(E))
+        mp = m._split_map.cpu().tolist()
+        hist = m._split_hist.cpu().tolist()
+        resident, counts = [False] * E, [0.0] * E
+        for r in range(E):
+            resident[perm[r]] = mp[r] < first
+            counts[perm[r]] = round(float(hist[r]), 4)
+        layers[m.key] = dict(num_experts = E, gpu_slots = first, resident = resident, hist = counts)
+    if not layers:
+        return 0
+    data = {"format": SPLIT_PLACEMENT_FORMAT, "meta": meta or {}, "layers": layers}
+    d = os.path.dirname(os.path.abspath(path))
+    os.makedirs(d, exist_ok = True)
+    tmp = path + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump(data, f)
+    os.replace(tmp, path)
+    return len(layers)
+
+
+def load_split_placement(infer_params, path, meta = None):
+    """Report how the placement at `path` was applied. The placement itself is applied while
+    the model loads (EXL3_MOE_PLACEMENT_LOAD must name the same file), since it seeds the
+    load-time expert order: nothing moves here. Layers whose expert count or GPU slot count
+    differ from the file (e.g. a changed cpu_moe_split_experts) are skipped. Raises ValueError
+    when the file's meta entries disagree with `meta` (e.g. a different model) or the file
+    could not be used. Returns (layers_applied, swaps, skipped_keys); swaps is always 0."""
+    st = getattr(infer_params, "moe_placement_seed", None)
+    if st is None or os.path.abspath(st["path"]) != os.path.abspath(path):
+        if os.environ.get("EXL3_MOE_PLACEMENT_LOAD") != path:
+            raise ValueError("the placement is applied at model load: set EXL3_MOE_PLACEMENT_LOAD to it before loading")
+        return 0, 0, []
+    if st["error"]:
+        raise ValueError(st["error"])
+    saved_meta, _ = _split_placement_read(path)
+    for k, v in (meta or {}).items():
+        if k in saved_meta and saved_meta[k] != v:
+            raise ValueError(f"placement file was saved for {k}={saved_meta[k]!r}, not {v!r}")
+    reg = getattr(infer_params, "moe_cpu_swap_modules", None) or []
+    applied = [m.key for m in reg if getattr(m, "_split_placement_seeded", False)]
+    skipped = [m.key for m in reg if not getattr(m, "_split_placement_seeded", False)]
+    return len(applied), 0, skipped
+
+
 def trellis_rate(tile_width: int):
     """Bitrate of an EXL3 trellis from its tile width (last dim): an integer 1..8 for 16 * K, a
     half-integer 1.5 / 2.5 / 3.5 for 16 * K + 8, None for anything the CPU kernels don't take"""
@@ -845,6 +969,7 @@ class BlockSparseMLP_CPU:
         # 37.5% uniform, cutting the CPU share per layer ~4.5x
         self._split_perm = None
         self._split_seeded = False
+        self._split_placement_seeded = False
         self._split_saved_lists = (self.gates, self.ups, self.downs)
         # Dynamic placement (default; EXL3_MOE_CPU_SWAP=0 disables): both the GPU's E - k
         # slots and the worker's k slots hold a CHANGING set of experts; a per-layer
@@ -881,7 +1006,9 @@ class BlockSparseMLP_CPU:
                 if counts is None:
                     print(f" !! {self.key}: no routing stats for layer, tail placement unpermuted")
             else:
-                counts = _expert_stats_load(self.config, self.num_experts).get(self.key)
+                counts = _split_placement_seed(self, first)     # local patch: named profile
+                if counts is None:
+                    counts = _expert_stats_load(self.config, self.num_experts).get(self.key)
         if counts is not None and len(counts) == self.num_experts:
             perm = sorted(range(self.num_experts), key = lambda e: -counts[e])
             self._split_perm = perm
