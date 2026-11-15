@@ -16,6 +16,153 @@ ExLlamaV3 is an inference library for running local LLMs on modern consumer GPUs
 > [!TIP]
 > **Looking for a server?** [TabbyAPI](https://github.com/theroyallab/tabbyAPI/) is the official and recommended backend server. It provides an OpenAI-compatible API for local or remote inference, HF model downloading, embedding model support, and HF Jinja2 chat templates. Its startup script manages and installs prerequisites to help you get started.
 
+## About this fork
+
+This fork adds local patches to ExLlamaV3. The branch `local-patches` has one commit for each patch. The commits are on top of the release tag `v1.6.7`. The patches are not part of upstream ExLlamaV3, and upstream does not support them.
+
+> [!IMPORTANT]
+> **This fork is for one unusual hardware combination.** I tune the patches for my hardware only, with one model: Qwen3.8-Flash-Next, 4.05 bpw EXL3. I do not test other hardware or other models. The patches can be slower or not work on your system. Your results can be different (YMMV).
+
+### Hardware and constraints
+
+| Part | Detail |
+|---|---|
+| GPU 0 | RTX 3090, 24 GB, PCIe 4.0 x16 (20.6 GB/s measured) |
+| GPU 1 | RTX 4090, 24 GB, PCIe 3.0 x4 (3.3 GB/s measured). This slot is a B660 chipset slot. |
+| CPU | Intel i7-13700K: 8 P-cores and 8 E-cores, AVX2, no AVX-512 |
+| RAM | 64 GB |
+| Motherboard | ASUS ProArt B660-CREATOR D4. The 4090 and one NVMe share the chipset link to the CPU (DMI 4.0 x4). |
+
+The constraints of this system are:
+
+- **The 4090 has a slow link.** Its x4 link is approximately 6 times slower than the x16 link of the 3090. Thus, the CPU expert split goes only on layers of the 3090. Prefill sends experts only over the x16 link. The layers on the 4090 keep all experts in VRAM.
+- **The VRAM is full.** At 215,040 tokens of context, the 3090 has almost no free VRAM. A context of 225,280 tokens does not load.
+- **The 3090 has a power limit of 270 W.** Its GDDR6X memory reached 108 °C at full power. 350 W does not give faster decode.
+- **The E-cores are slow for the CPU experts.** The CPU expert workers use only the 8 P-cores, with one pinned worker on each core. Workers on E-cores decrease decode from approximately 32 to 19 T/s.
+- **The RAM is 64 GB.** Approximately 23 GB of expert weights stay in RAM. The 39 GB engram table streams from an NVMe disk.
+
+The settings for this system are in the TabbyAPI configuration and start script. They are not part of this repository.
+
+| Patch | Function |
+|---|---|
+| `EXL3_MOE_CPU_SPLIT_DRAFT` | Keeps the MTP layer fully in VRAM when the CPU expert split is on. |
+| Expert placement | Saves the dynamic CPU-MoE expert placement to a file. Loads the placement at the next start. |
+| Prefill pipeline | Adds engram lookahead, resident-first expert order, stream-ahead and an optional last-page merge. Each item has an `EXL3_*` switch. |
+| Control vectors | Applies llama.cpp control vectors to the residual stream. Refer to [Control vectors](#control-vectors). |
+
+### Control vectors
+
+#### Overview
+
+A control vector changes the residual stream of the model during inference. It does not change the model weights. This patch applies control vectors in the llama.cpp format. It is a port of the `--control-vector` function of llama.cpp. It also includes the projection mode of [Cudecnik/Qwen3.8-Flash-Next-refusal-projection](https://huggingface.co/Cudecnik/Qwen3.8-Flash-Next-refusal-projection).
+
+The patch has two modes:
+
+- **Projection (`project`).** The patch removes one direction from the residual stream: `h = h - s·(h·v)·v`. `v` is the unit vector for the layer. `s` is the scale.
+- **Addition (`add`).** The patch adds the vector to the residual stream: `h = h + s·v`. This is the standard llama.cpp mode.
+
+The patch is off by default. It has no effect until you set `EXL3_CVEC`.
+
+#### Prepare the vector file
+
+llama.cpp keeps control vectors in GGUF files. This patch reads safetensors files. Convert the GGUF file one time:
+
+```sh
+python -I util/cvec_gguf_to_safetensors.py refusal-projection.gguf refusal-projection.safetensors
+```
+
+The script only reads the GGUF file. It does not run code from the file. The script shows the number of directions, the layer range and the norm of the vectors.
+
+#### Settings
+
+| Variable | Value | Default |
+|---|---|---|
+| `EXL3_CVEC` | The path to the safetensors file | Not set. The patch is off. |
+| `EXL3_CVEC_MODE` | `project` or `add` | `project` |
+| `EXL3_CVEC_SCALE` | The scale `s` | `1.0` |
+| `EXL3_CVEC_LAYERS` | The layer range `a-b`. The range includes `a` and `b`. | All layers in the file |
+
+The layer numbers are the same as in llama.cpp. The tensor `direction.k` applies after decoder layer `k`. The first layer is layer 0. llama.cpp does not keep a direction for layer 0.
+
+#### Procedure
+
+1. Set the variables in the environment of the process that loads the model. This process can be TabbyAPI, an example script or an eval script.
+2. Start the process.
+3. Make sure that the log shows a line of this type:
+
+   ```
+    -- Control vector: mode = project, scale = 1.0, layers 4..44 (41 directions) from ...
+   ```
+
+4. If the log does not show this line, the vector is not active. Make sure that `EXL3_CVEC` is set and that the patch is installed.
+
+Example for Qwen3.8-Flash-Next with TabbyAPI:
+
+```sh
+EXL3_CVEC=/path/to/refusal-projection.safetensors EXL3_CVEC_MODE=project EXL3_CVEC_LAYERS=4-44 python main.py
+```
+
+To use the stock model again, remove `EXL3_CVEC` from the environment and start the process again.
+
+#### How the patch works
+
+The patch changes `TransformerBlock.forward` in `exllamav3/modules/transformer.py`. At the end of each decoder block, the patch applies the vector to the residual stream. This is the same point as `build_cvec` in llama.cpp.
+
+- Models with hyper-connections keep the residual as parallel streams. The patch applies the vector to each stream.
+- The patch does not apply the vector to the MTP head. The steered model does the verification of all draft tokens. Thus, the output is the output of the steered model.
+- During decode, `GatedResidual` gives the next site a weighted copy of the streams. When the vector changes the streams, this copy becomes incorrect. The patch removes the copy. The next site then calculates the weights again.
+- The projection changes the streams in place. It does not use more VRAM during prefill.
+
+#### Test results
+
+Model: Qwen3.8-Flash-Next, 4.05 bpw EXL3. Vector: refusal projection, layers 4 to 44, scale 1.0.
+
+| Test | Stock model | With the vector |
+|---|---|---|
+| Refusals, 6 refusal test prompts | 6 | 0 |
+| Answers, 2 harmless control prompts | 2 | 2 |
+| Mean KL divergence from stock, 8,192 tokens of text | 0.017 (noise) | 0.077 |
+
+The noise value is the KL divergence between two runs of the stock model. Dynamic expert placement causes this difference. A unit test also compares the decode path with a reference calculation. The two results are the same.
+
+#### Performance
+
+The test uses the hardware in [Hardware and constraints](#hardware-and-constraints), with TabbyAPI. The settings are greedy decode and thinking off, with MTP and hybrid drafting. Each run uses a new server. There are 2 runs of each condition.
+
+| Workload | Stock (2 runs) | With the vector (2 runs) | Difference |
+|---|---|---|---|
+| Cold 14.9K-token prompt, prefill | 1,760 / 1,701 T/s | 1,703 / 1,695 T/s | −1.8%. The two stock runs differ by 3.4%. |
+| Decode, first run (warm-up) | 62.3 / 61.6 T/s | 60.1 / 60.8 T/s | −2.4% (approximately 1 T/s) |
+| Decode, mean of runs 2 to 4 | 78.7 / 77.0 T/s | 78.6 / 78.3 T/s | None (+0.7%) |
+| Whole-file edit, second run | 106.9 / 103.3 T/s | 102.7 / 102.1 T/s | −2.6%. The two stock runs differ by 3.4%. |
+| Accepted MTP draft tokens (decode / edit) | 183–188 / 824–829 | 183–188 / 829 | The same |
+| Edit grade | Exact, 4 of 4 | Exact, 4 of 4 | The same |
+
+No noticeable performance difference occurs. All differences are approximately equal to the difference between the two stock runs. If a cost occurs, it is 2–3% or less. Two runs of each condition cannot show a smaller difference.
+
+Compare this result with the llama.cpp implementation of Cudecnik:
+
+| Item | Cudecnik, llama.cpp (source README) | This port, exllamav3 |
+|---|---|---|
+| Decode speed | 93% of stock (approximately 7% less) | No noticeable difference |
+| Extra VRAM | Not given in the README. The default projection makes a temporary tensor of the full residual size at each layer: approximately 42 MB for a 1,024-token batch. | Approximately 420 KB of vectors on each GPU. The projection changes the streams in place. |
+
+On this system, the 3090 has no free VRAM at 215,040 tokens of context. The server with the vector loads at 215,040 tokens with the same split. Thus, the extra VRAM is not important. This test did not measure the VRAM directly.
+
+The two implementations add approximately the same small GPU operations for each layer. On this system, each decode step also waits for the CPU experts, and MTP with hybrid drafting gives more than one token for each forward pass. Thus, the cost of the operations is a smaller part of the step time. This explanation is an estimate. It is not a profiler measurement. On a system with all experts in VRAM, the cost can be larger.
+
+The test prompts are neutral. On refusal test prompts, MTP acceptance can decrease, because the MTP head is not steered. This test did not measure that effect.
+
+#### Limits
+
+- The vector applies to all requests that the process runs. You cannot set a vector for each request.
+- Tensor-parallel mode is not tested.
+- Only Qwen3.8-Flash-Next is tested. The patch applies to blocks with keys of the type `...layers.N`. Other models can work, but they are not tested.
+- A control vector is specific to one model. Do not use a vector from a different model.
+
+> [!NOTE]
+> A refusal vector removes a safety behavior of the model. You are responsible for the output of the model.
+
 <p align="center">
   <img src="doc/qb_kld.png" width="640" alt="Llama 3.1 8B Instruct quantization benchmark across bits per weight">
 </p>

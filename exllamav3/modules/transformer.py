@@ -7,6 +7,100 @@ from ..model.config import Config
 from . import Module, RMSNorm, LayerNorm, Attention, GatedDeltaNet, GatedMLP, MLP, BlockSparseMLP, Linear
 from .hyperconnections import HyperConnection, hc_flush
 from ..util import profile_opt
+import os
+import re
+
+# Local patch (exl3_control_vector): llama.cpp-style control vectors on the residual stream of the
+# trunk's decoder blocks, applied at the end of each block (after the MLP site's residual update, i.e.
+# llama.cpp's build_cvec on the layer output).
+#
+#   EXL3_CVEC=<file.safetensors>   tensors "direction.<k>" ([hidden] f32), llama.cpp numbering:
+#                                  direction.k applies after decoder layer k (0-based); convert a
+#                                  llama.cpp GGUF with util/cvec_gguf_to_safetensors.py
+#   EXL3_CVEC_MODE=project|add     project: h -= s * (h.v) v with v unit-normalized and s = |v| * scale
+#                                  (the qwen4exp cvec-projection-mode patch); add: h += scale * v
+#                                  (llama.cpp's stock --control-vector-scaled). Default project
+#   EXL3_CVEC_SCALE=<float>        default 1.0
+#   EXL3_CVEC_LAYERS=<a>-<b>       inclusive layer range, llama.cpp's --control-vector-layer-range.
+#                                  Default: every layer with a direction
+#
+# With hyper-connections the residual is the (bsz, seq, hc, hidden) stream stack and every stream is
+# projected (added to) separately, as llama.cpp's apply_to on res_hc. Only blocks keyed
+# "...layers.<k>" outside the MTP head are steered; draft heads stay stock (verification is done by the
+# steered trunk). Off when EXL3_CVEC is unset.
+
+_cvec_state = None
+
+
+def _cvec_table():
+    global _cvec_state
+    if _cvec_state is None:
+        _cvec_state = {}
+        path = os.environ.get("EXL3_CVEC")
+        if path:
+            from safetensors.torch import load_file
+            mode = os.environ.get("EXL3_CVEC_MODE", "project").strip().lower()
+            if mode not in ("project", "add"):
+                raise ValueError(f"EXL3_CVEC_MODE must be project or add, not {mode!r}")
+            scale = float(os.environ.get("EXL3_CVEC_SCALE", "1.0"))
+            rng = os.environ.get("EXL3_CVEC_LAYERS")
+            lo, hi = (int(t) for t in rng.split("-")) if rng else (0, 1 << 30)
+            dirs = {}
+            for k, t in load_file(path).items():
+                m = re.fullmatch(r"direction\.(\d+)", k)
+                if m and lo <= int(m.group(1)) <= hi:
+                    v = t.float().flatten() * scale
+                    if mode == "project":
+                        n = float(v.norm())
+                        if n == 0.0:
+                            continue
+                        dirs[int(m.group(1))] = (v / n, n)
+                    else:
+                        dirs[int(m.group(1))] = (v, 1.0)
+            _cvec_state = {"mode": mode, "dirs": dirs}
+            ls = sorted(dirs)
+            print(f" -- Control vector: mode = {mode}, scale = {scale}, layers "
+                  f"{ls[0] if ls else '-'}..{ls[-1] if ls else '-'} ({len(ls)} directions) from {path}")
+    return _cvec_state
+
+
+def _cvec_for_block(block, device):
+    """(vector on device, s) for this block, or None. Cached per block and device"""
+    cached = block.__dict__.get("_cvec_cache")
+    if cached is not None and cached[0] == device:
+        return cached[1]
+    entry = None
+    table = _cvec_table()
+    if table:
+        m = re.search(r"(?:^|\.)layers\.(\d+)$", block.key or "")
+        if m and not (block.key.startswith("mtp") or ".mtp." in block.key):
+            d = table["dirs"].get(int(m.group(1)))
+            if d is not None:
+                entry = (d[0].to(device), d[1], table["mode"])
+    block._cvec_cache = (device, entry)
+    return entry
+
+
+def _cvec_apply(block, x, params):
+    cv = _cvec_for_block(block, x.device)
+    if cv is None:
+        return x
+    v, s, mode = cv
+    # A deferred residual update (mHC) must land first, and a successor's weighted copy of the
+    # streams made by apply_ (GatedResidual) is stale once they change: drop it, the next mix
+    # then weights the streams in its own kernel
+    hc_flush(params)
+    params.pop("gr_weighted", None)
+    if v.dtype != x.dtype:
+        v = v.to(x.dtype)
+    x2 = x.view(-1, x.shape[-1]) if x.is_contiguous() else None
+    if mode == "add":
+        x.add_(v)
+    elif x2 is not None:
+        x2.addr_(x2 @ v, v, alpha = -s)      # in place: x -= s * (x.v) v, no stream-sized temporary
+    else:
+        x.sub_((x @ v).unsqueeze(-1) * (s * v))
+    return x
 
 class TransformerBlock(Module):
 
@@ -225,12 +319,13 @@ class TransformerBlock(Module):
                 self.mlp_post_norm.forward(y, params, residual = x)
             elif (
                 params.get("resid_defer") and not export_state and self.layer_scalar_f is None and
-                (out_dtype or self.out_dtype) in (None, x.dtype)
+                (out_dtype or self.out_dtype) in (None, x.dtype) and _cvec_for_block(self, x.device) is None
             ):
                 params["resid_pending"] = y
                 return x
             else:
                 x += y
+            x = _cvec_apply(self, x, params)     # local patch: control vector
 
         if export_state:
             s = params.get("export_states")
