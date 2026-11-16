@@ -442,10 +442,22 @@ class Generator:
         if previous is not None:
             previous.close()
         self.pipeline = None
+        # Local patch: EXL3_PIPELINED_PREFILL=0 turns the pipeline off (A/B switch; tabby has no option for it)
+        if os.environ.get("EXL3_PIPELINED_PREFILL", "1") == "0":
+            pipelined_prefill = False
         plan = PrefillPipeline.plan(self.model, cache, draft_model) if pipelined_prefill else None
         if plan is not None:
             on_idle = self.recurrent_cache.write_settled if self.recurrent_cache is not None else None
             self.pipeline = PrefillPipeline(self.model, *plan, on_idle = on_idle)
+        if len({torch.device(m.device) for m, _, _ in getattr(self.model, "fwd_modules", None) or []
+                if m.device is not None and torch.device(m.device).type == "cuda"}) > 1:
+            if self.pipeline is not None:
+                route = " -> ".join(str(d) for d in self.pipeline.route)
+                print(f" -- Pipelined prefill: on, route {route}"
+                      f"{' (last stage: draft model)' if plan[1] is not None else ''}")
+            else:
+                print(f" -- Pipelined prefill: off "
+                      f"({'disabled' if not pipelined_prefill else 'this split cannot run pipelined'})")
         self.model.pipeline = self.pipeline
         if draft_model is not None:
             draft_model.pipeline = self.pipeline

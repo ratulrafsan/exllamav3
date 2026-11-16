@@ -49,6 +49,7 @@ The settings for this system are in the TabbyAPI configuration and start script.
 | Expert placement | Saves the dynamic CPU-MoE expert placement to a file. Loads the placement at the next start. |
 | Prefill pipeline | Adds engram lookahead, resident-first expert order, stream-ahead and an optional last-page merge. Each item has an `EXL3_*` switch. |
 | Control vectors | Applies llama.cpp control vectors to the residual stream. Refer to [Control vectors](#control-vectors). |
+| Pipelined prefill with CPU experts | Lets the two GPUs work on different prefill chunks when the CPU expert split is on. This is a port of [a commit by Auryn Macmillan](https://github.com/auryn-macmillan/exllamav3/commit/b38de78bd0376fcdc4f92344ed405800ac8374b6). The port also adds a lock to the n-gram row table. Prefill of prompts longer than one chunk is approximately 10% faster. `EXL3_PIPELINED_PREFILL=0` turns it off. |
 
 ### Control vectors
 

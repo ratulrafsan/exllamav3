@@ -1,5 +1,6 @@
 from __future__ import annotations
 import os
+import threading
 from concurrent.futures import ThreadPoolExecutor
 import torch
 from ..loader.safetensors import DiskTensorHandle
@@ -21,6 +22,12 @@ thread (prefetch()). Each queued prefetch owns one staging set; lookup() takes t
 staged ids equal the ones it was given and stages inline otherwise, so a prefetch for the wrong
 ids can only cost time. A set's CUDA event marks the last lookup's uploads from it; the next
 writer waits on it before reusing the buffers.
+
+Local patch (pipelined prefill with CPU experts): prefetch() and lookup() can be called from
+different threads, the generator's (n-gram lookahead) and a prefill stage's. The queue of
+prefetches, the staging sets' `held` flags and the stats are guarded by one lock, so a lookup
+claims its set atomically and no prefetch can retire it or stage into it meanwhile. The
+gather, the upload and the decode run outside the lock, on a set the caller holds.
 """
 
 PREFETCH_ENABLED = os.environ.get("EXL3_NGRAM_PREFETCH", "1") != "0"   # debug/A-B switch
@@ -69,6 +76,7 @@ class RowTable:
         self._locked = []           # mlock()ed (address, size) ranges of the stores
         self._pins = []             # pinned staging sets (see _PinSet)
         self._pending = []          # queued prefetches, oldest first: {"ids", "pin", "future"}
+        self._lock = threading.RLock()  # guards _pending, _pins, held flags, _executor, stats
         self._executor = None
         self.prefetch_stats = {"hit": 0, "miss": 0, "retired": 0}
         self.hinted = False         # the owner announces rows ahead of their lookup (advise())
@@ -161,7 +169,8 @@ class RowTable:
             unlock_host_ranges(self._locked)
             self._locked = []
         self.stores = None
-        self._pins = []
+        with self._lock:
+            self._pins = []
 
     def export(self, stc) -> dict:
         """
@@ -222,11 +231,12 @@ class RowTable:
                              os.POSIX_FADV_WILLNEED)
 
     def drain_prefetch(self):
-        for e in list(self._pending):
-            self._retire(e)
-        if self._executor is not None:
-            self._executor.shutdown(wait = True)
-            self._executor = None
+        with self._lock:
+            for e in list(self._pending):
+                self._retire(e)
+            if self._executor is not None:
+                self._executor.shutdown(wait = True)
+                self._executor = None
 
     def _forget(self, entry: dict):
         # by identity: list.remove would compare the entries' id tensors
@@ -243,7 +253,8 @@ class RowTable:
         entry["pin"].held = False
 
     def _acquire_pin(self, n: int) -> _PinSet:
-        """A staging set not held by a queued prefetch, grown to n rows."""
+        """A staging set not held by a queued prefetch, grown to n rows. Caller holds _lock
+        (_forget, _retire and _match likewise)."""
         free = [p for p in self._pins if not p.held]
         if not free and len(self._pins) < MAX_PIN_SETS:
             free = [_PinSet()]
@@ -323,19 +334,20 @@ class RowTable:
         if not PREFETCH_ENABLED or self.stores is None:
             return
         ids = ids.to("cpu", torch.int64).contiguous().clone()
-        if self._match(ids) is not None:
-            return
-        if self.on_disk:
-            for h in self.stores:
-                h._ensure_open()    # lazy open isn't thread-safe; do it here, not on the worker
-        pin = self._acquire_pin(n)
-        if self._executor is None:
-            self._executor = ThreadPoolExecutor(max_workers = 1, thread_name_prefix = "row_prefetch")
-        self._pending.append({
-            "ids": ids,
-            "pin": pin,
-            "future": self._executor.submit(self._stage, ids, pin, resolve),
-        })
+        with self._lock:
+            if self._match(ids) is not None:
+                return
+            if self.on_disk:
+                for h in self.stores:
+                    h._ensure_open()    # lazy open isn't thread-safe; do it here, not on the worker
+            pin = self._acquire_pin(n)
+            if self._executor is None:
+                self._executor = ThreadPoolExecutor(max_workers = 1, thread_name_prefix = "row_prefetch")
+            self._pending.append({
+                "ids": ids,
+                "pin": pin,
+                "future": self._executor.submit(self._stage, ids, pin, resolve),
+            })
 
     def lookup(
         self,
@@ -357,14 +369,20 @@ class RowTable:
             decode loop), so the uploads need no event to guard the staging set
         Returns the (n, dim) decoded rows on the device.
         """
-        entry = self._match(ids)
-        if entry is not None:
-            self._forget(entry)
-            self.prefetch_stats["hit"] += 1
-            pin = entry["pin"]
-        else:
-            self.prefetch_stats["miss"] += 1
-            pin = self._acquire_pin(n)
+        # Claim the staging set under the lock: matched and taken off the queue in one step, so
+        # no other thread's prefetch can retire it in between (and then stage into it)
+        with self._lock:
+            entry = self._match(ids)
+            if entry is not None:
+                self._forget(entry)
+                self.prefetch_stats["hit"] += 1
+                pin = entry["pin"]
+            else:
+                self.prefetch_stats["miss"] += 1
+                pin = self._acquire_pin(n)
+                if self.on_disk:
+                    for h in self.stores:
+                        h._ensure_open()    # (the inline gather below runs outside the lock)
         try:
             U, in_order = entry["future"].result() if entry is not None else self._stage(ids, pin, resolve)
             out = decode(pin.packed[:U].to(device, non_blocking = True), pin, U)
@@ -379,10 +397,12 @@ class RowTable:
         except BaseException:
             # a failed gather, upload or decode must not keep its staging set; an interrupted wait
             # leaves the set with its prefetch, whose worker may still be writing it
-            if entry is not None and not entry["future"].done():
-                self._pending.append(entry)
-            else:
-                pin.held = False
+            with self._lock:
+                if entry is not None and not entry["future"].done():
+                    self._pending.append(entry)
+                else:
+                    pin.held = False
             raise
-        pin.held = False
+        with self._lock:
+            pin.held = False
         return out
