@@ -1,0 +1,722 @@
+#include <cuda_fp16.h>
+#include "inkling2.cuh"
+#include <c10/cuda/CUDAGuard.h>
+#include <ATen/cuda/CUDAContext.h>
+#include "util.h"
+#include "util.cuh"
+
+// Local patch: Inkling-2 decode-step kernels, see inkling2.cuh
+
+#define I2_THREADS 256
+#define I2_MAX_STATES 16
+#define I2_MAX_TAPS 8
+#define I2_MAX_RANK 64
+
+// ---------------------------------------------------------------------------------------------------------------
+// Convolution step
+
+template <bool X_HALF>
+__launch_bounds__(I2_THREADS)
+__global__ void i2_conv_step_kernel
+(
+    const void* __restrict__ x_,
+    half* __restrict__ ring,
+    const float* __restrict__ w,
+    const float* __restrict__ dyn,
+    const int64_t* __restrict__ ctl,
+    float* __restrict__ out,
+    const int S,
+    const int C,
+    const int R,
+    const int k,
+    const int heads,
+    const float scale
+)
+{
+    const int idx = blockIdx.x * I2_THREADS + threadIdx.x;
+    if (idx >= S * C) return;
+    const int s = idx / C, c = idx % C;
+    const int64_t pos = ctl[0];
+    #define I2_X(si) (X_HALF ? __half2float(((const half*) x_)[(size_t) (si) * C + c]) : ((const float*) x_)[(size_t) (si) * C + c])
+    const float xv = I2_X(s);
+    const float* dt = dyn ? dyn + ((size_t) s * heads + c / (C / heads)) * k : nullptr;
+    float acc = 0.0f;
+    for (int j = 0; j < k - 1; ++j)
+    {
+        // The input k - 1 - j positions back: one of the new tokens, or (before the first of them) the ring. The
+        // ring rows read here are never among the rows this launch writes
+        const int si = s - (k - 1) + j;
+        const float in = si >= 0 ? I2_X(si) : __half2float(ring[(size_t) ((pos + si) % R) * C + c]);
+        acc += (w[c * k + j] + (dt ? dt[j] : 0.0f)) * in;
+    }
+    acc += (w[c * k + k - 1] + (dt ? dt[k - 1] : 0.0f)) * xv;
+    out[(size_t) s * C + c] = (acc + xv) * scale;
+    ring[(size_t) ((pos + s) % R) * C + c] = __float2half_rn(xv);
+    #undef I2_X
+}
+
+void i2_conv_step
+(
+    const at::Tensor& x,
+    at::Tensor ring,
+    const at::Tensor& w,
+    const c10::optional<at::Tensor>& dyn,
+    const at::Tensor& ctl,
+    at::Tensor out,
+    float scale
+)
+{
+    const at::cuda::OptionalCUDAGuard device_guard(x.device());
+    cudaStream_t stream = at::cuda::getCurrentCUDAStream().stream();
+    TORCH_CHECK(x.dim() == 2, "i2_conv_step: x must be [S, C]");
+    const int S = (int) x.size(0), C = (int) x.size(1);
+    TORCH_CHECK(ring.dim() == 2 && ring.size(1) == C && ring.scalar_type() == at::kHalf, "i2_conv_step: ring");
+    TORCH_CHECK(w.dim() == 2 && w.size(0) == C && w.scalar_type() == at::kFloat && w.is_contiguous(), "i2_conv_step: w");
+    TORCH_CHECK(out.numel() == (int64_t) S * C && out.scalar_type() == at::kFloat, "i2_conv_step: out");
+    TORCH_CHECK(ctl.scalar_type() == at::kLong, "i2_conv_step: ctl");
+    TORCH_CHECK(x.is_contiguous() && ring.is_contiguous() && out.is_contiguous(), "i2_conv_step: contiguity");
+    const int k = (int) w.size(1);
+    TORCH_CHECK(k >= 1 && k <= I2_MAX_TAPS && S + k - 1 <= ring.size(0), "i2_conv_step: taps / ring size");
+    const float* dp = nullptr;
+    int heads = 1;
+    if (dyn.has_value())
+    {
+        const at::Tensor& d = dyn.value();
+        TORCH_CHECK(d.dim() == 3 && d.size(0) == S && d.size(2) == k && d.scalar_type() == at::kFloat && d.is_contiguous(), "i2_conv_step: dyn");
+        TORCH_CHECK(C % d.size(1) == 0, "i2_conv_step: heads");
+        heads = (int) d.size(1);
+        dp = (const float*) d.data_ptr();
+    }
+    const int blocks = CEIL_DIVIDE(S * C, I2_THREADS);
+    if (x.scalar_type() == at::kHalf)
+        i2_conv_step_kernel<true><<<blocks, I2_THREADS, 0, stream>>>(
+            x.data_ptr(), (half*) ring.data_ptr(), (const float*) w.data_ptr(), dp, (const int64_t*) ctl.data_ptr(),
+            (float*) out.data_ptr(), S, C, (int) ring.size(0), k, heads, scale);
+    else
+    {
+        TORCH_CHECK(x.scalar_type() == at::kFloat, "i2_conv_step: x dtype");
+        i2_conv_step_kernel<false><<<blocks, I2_THREADS, 0, stream>>>(
+            x.data_ptr(), (half*) ring.data_ptr(), (const float*) w.data_ptr(), dp, (const int64_t*) ctl.data_ptr(),
+            (float*) out.data_ptr(), S, C, (int) ring.size(0), k, heads, scale);
+    }
+    cuda_check(cudaPeekAtLastError());
+}
+
+// ---------------------------------------------------------------------------------------------------------------
+// Block attention residual: one block per query
+
+template <bool H_HALF>
+__launch_bounds__(I2_THREADS)
+__global__ void i2_attn_res_kernel
+(
+    const float* __restrict__ blocks,
+    const void* hidden_,
+    const float* __restrict__ queries,
+    float* __restrict__ out,
+    const int n,
+    const int S,
+    const int D,
+    const float eps
+)
+{
+    // partial sums per thread: [0] = sum of squares of hidden, [1] = q . hidden, [2 + s] = q . block s
+    __shared__ float part[I2_MAX_STATES + 2][I2_THREADS];
+    __shared__ float p[I2_MAX_STATES + 1];
+    __shared__ float rn_s;
+    const int t = threadIdx.x;
+    const int tok = blockIdx.y;
+    const float* q = queries + (size_t) blockIdx.x * D;
+    float* o = out + ((size_t) blockIdx.x * S + tok) * D;
+    // This token's rows: hidden [S, D], blocks [n, S, D]
+    hidden_ = (const void*) ((const char*) hidden_ + (size_t) tok * D * (H_HALF ? sizeof(half) : sizeof(float)));
+    const float* blocks_t = blocks + (size_t) tok * D;
+    const size_t bstep = (size_t) S * D;
+
+    float acc[I2_MAX_STATES + 2];
+    for (int s = 0; s < n + 2; ++s) acc[s] = 0.0f;
+    for (int i = t; i < D; i += I2_THREADS)
+    {
+        const float h = H_HALF ? __half2float(((const half*) hidden_)[i]) : ((const float*) hidden_)[i];
+        const float qv = q[i];
+        acc[0] += h * h;
+        acc[1] += qv * h;
+        for (int s = 0; s < n; ++s) acc[2 + s] += qv * blocks_t[s * bstep + i];
+    }
+    for (int s = 0; s < n + 2; ++s) part[s][t] = acc[s];
+    __syncthreads();
+    for (int stride = I2_THREADS / 2; stride > 0; stride >>= 1)
+    {
+        if (t < stride)
+            for (int s = 0; s < n + 2; ++s) part[s][t] += part[s][t + stride];
+        __syncthreads();
+    }
+    if (t == 0)
+    {
+        const float rn = rsqrtf(part[0][0] / (float) D + eps);
+        const float sc = rsqrtf((float) D);
+        // scores: blocks first, hidden last (the order of the stacked states)
+        float mx = part[1][0] * rn * sc;
+        for (int s = 0; s < n; ++s) mx = fmaxf(mx, part[2 + s][0] * sc);
+        float sum = 0.0f;
+        for (int s = 0; s < n; ++s) { p[s] = expf(part[2 + s][0] * sc - mx); sum += p[s]; }
+        p[n] = expf(part[1][0] * rn * sc - mx); sum += p[n];
+        for (int s = 0; s <= n; ++s) p[s] /= sum;
+        rn_s = rn;
+    }
+    __syncthreads();
+    const float rn = rn_s;
+    for (int i = t; i < D; i += I2_THREADS)
+    {
+        const float h = H_HALF ? __half2float(((const half*) hidden_)[i]) : ((const float*) hidden_)[i];
+        float v = p[n] * h * rn;
+        for (int s = 0; s < n; ++s) v += p[s] * blocks_t[s * bstep + i];
+        o[i] = v;
+    }
+}
+
+void i2_attn_res
+(
+    const c10::optional<at::Tensor>& blocks,
+    const at::Tensor& hidden,
+    const at::Tensor& queries,
+    at::Tensor out,
+    float eps
+)
+{
+    const at::cuda::OptionalCUDAGuard device_guard(hidden.device());
+    cudaStream_t stream = at::cuda::getCurrentCUDAStream().stream();
+    TORCH_CHECK(hidden.dim() == 2, "i2_attn_res: hidden must be [S, D]");
+    const int S = (int) hidden.size(0), D = (int) hidden.size(1);
+    TORCH_CHECK(queries.dim() == 2 && queries.size(1) == D && queries.scalar_type() == at::kFloat && queries.is_contiguous(), "i2_attn_res: queries");
+    const int nq = (int) queries.size(0);
+    TORCH_CHECK(out.numel() == (int64_t) nq * S * D && out.scalar_type() == at::kFloat && out.is_contiguous(), "i2_attn_res: out");
+    TORCH_CHECK(hidden.is_contiguous(), "i2_attn_res: hidden");
+    int n = 0;
+    const float* bp = nullptr;
+    if (blocks.has_value())
+    {
+        const at::Tensor& b = blocks.value();
+        n = (int) (b.numel() / ((int64_t) S * D));
+        TORCH_CHECK(b.numel() == (int64_t) n * S * D && b.scalar_type() == at::kFloat && b.is_contiguous(), "i2_attn_res: blocks");
+        TORCH_CHECK(n <= I2_MAX_STATES, "i2_attn_res: too many block states");
+        bp = (const float*) b.data_ptr();
+    }
+    if (hidden.scalar_type() == at::kHalf)
+        i2_attn_res_kernel<true><<<dim3(nq, S), I2_THREADS, 0, stream>>>(
+            bp, hidden.data_ptr(), (const float*) queries.data_ptr(), (float*) out.data_ptr(), n, S, D, eps);
+    else
+    {
+        TORCH_CHECK(hidden.scalar_type() == at::kFloat, "i2_attn_res: hidden dtype");
+        i2_attn_res_kernel<false><<<dim3(nq, S), I2_THREADS, 0, stream>>>(
+            bp, hidden.data_ptr(), (const float*) queries.data_ptr(), (float*) out.data_ptr(), n, S, D, eps);
+    }
+    cuda_check(cudaPeekAtLastError());
+}
+
+// ---------------------------------------------------------------------------------------------------------------
+// Message gate: two launches. The first computes g (one block per row of Wd, each also taking the two RMS values),
+// the second the per-channel forget / gain (one thread per channel)
+
+__launch_bounds__(I2_THREADS)
+__global__ void i2_message_gate_g_kernel
+(
+    const float* x,
+    const float* m,
+    const half* __restrict__ wd,
+    float* g,
+    const int D,
+    const float eps
+)
+{
+    __shared__ float red[3][I2_THREADS];
+    const int t = threadIdx.x;
+    const half* wr = wd + (size_t) blockIdx.x * 2 * D;
+    x += (size_t) blockIdx.y * D;
+    m += (size_t) blockIdx.y * D;
+    g += (size_t) blockIdx.y * gridDim.x;
+    float sx = 0.0f, sm = 0.0f, ax = 0.0f, am = 0.0f;
+    for (int i = t; i < D; i += I2_THREADS)
+    {
+        const float xv = x[i], mv = m[i];
+        sx += xv * xv;
+        sm += mv * mv;
+        ax += __half2float(wr[i]) * xv;
+        am += __half2float(wr[D + i]) * mv;
+    }
+    red[0][t] = sx; red[1][t] = sm;
+    __syncthreads();
+    for (int stride = I2_THREADS / 2; stride > 0; stride >>= 1)
+    {
+        if (t < stride) { red[0][t] += red[0][t + stride]; red[1][t] += red[1][t + stride]; }
+        __syncthreads();
+    }
+    const float rx = rsqrtf(red[0][0] / (float) D + eps);
+    const float rm = rsqrtf(red[1][0] / (float) D + eps);
+    __syncthreads();
+    red[2][t] = ax * rx + am * rm;
+    __syncthreads();
+    for (int stride = I2_THREADS / 2; stride > 0; stride >>= 1)
+    {
+        if (t < stride) red[2][t] += red[2][t + stride];
+        __syncthreads();
+    }
+    if (t == 0) g[blockIdx.x] = red[2][0];
+}
+
+__launch_bounds__(I2_THREADS)
+__global__ void i2_message_gate_apply_kernel
+(
+    const float* x,
+    const float* m,
+    const float* g,
+    const float* __restrict__ wf,
+    const float* __restrict__ wg,
+    float* out,
+    const int D,
+    const int r
+)
+{
+    __shared__ float gs[I2_MAX_RANK];
+    x += (size_t) blockIdx.y * D;
+    m += (size_t) blockIdx.y * D;
+    out += (size_t) blockIdx.y * D;
+    g += (size_t) blockIdx.y * r;
+    if (threadIdx.x < r) gs[threadIdx.x] = g[threadIdx.x];
+    __syncthreads();
+    const int d = blockIdx.x * I2_THREADS + threadIdx.x;
+    if (d >= D) return;
+    float f = 0.0f, gn = 0.0f;
+    const float* wfr = wf + (size_t) d * r;
+    const float* wgr = wg + (size_t) d * r;
+    for (int j = 0; j < r; ++j) { f += wfr[j] * gs[j]; gn += wgr[j] * gs[j]; }
+    out[d] = (1.0f - tanhf(f)) * x[d] + tanhf(gn) * m[d];
+}
+
+void i2_message_gate
+(
+    const at::Tensor& x,
+    const at::Tensor& m,
+    const at::Tensor& wd,
+    const at::Tensor& wf,
+    const at::Tensor& wg,
+    at::Tensor g,
+    at::Tensor out,
+    float eps
+)
+{
+    const at::cuda::OptionalCUDAGuard device_guard(x.device());
+    cudaStream_t stream = at::cuda::getCurrentCUDAStream().stream();
+    TORCH_CHECK(x.dim() == 2, "i2_message_gate: x must be [S, D]");
+    const int S = (int) x.size(0), D = (int) x.size(1);
+    TORCH_CHECK(wd.dim() == 2 && wd.size(1) == 2 * D && wd.scalar_type() == at::kHalf && wd.is_contiguous(), "i2_message_gate: wd");
+    const int r = (int) wd.size(0);
+    TORCH_CHECK(r <= I2_MAX_RANK, "i2_message_gate: rank");
+    TORCH_CHECK(wf.dim() == 2 && wf.size(0) == D && wf.size(1) == r && wf.scalar_type() == at::kFloat && wf.is_contiguous(), "i2_message_gate: wf");
+    TORCH_CHECK(wg.dim() == 2 && wg.size(0) == D && wg.size(1) == r && wg.scalar_type() == at::kFloat && wg.is_contiguous(), "i2_message_gate: wg");
+    TORCH_CHECK(x.scalar_type() == at::kFloat && m.scalar_type() == at::kFloat && m.numel() == (int64_t) S * D, "i2_message_gate: x, m");
+    TORCH_CHECK(out.numel() == (int64_t) S * D && out.scalar_type() == at::kFloat, "i2_message_gate: out");
+    TORCH_CHECK(x.is_contiguous() && m.is_contiguous() && out.is_contiguous(), "i2_message_gate: contiguity");
+    TORCH_CHECK(g.numel() >= (int64_t) S * r && g.scalar_type() == at::kFloat && g.is_contiguous(), "i2_message_gate: g");
+    i2_message_gate_g_kernel<<<dim3(r, S), I2_THREADS, 0, stream>>>(
+        (const float*) x.data_ptr(), (const float*) m.data_ptr(), (const half*) wd.data_ptr(),
+        (float*) g.data_ptr(), D, eps);
+    i2_message_gate_apply_kernel<<<dim3(CEIL_DIVIDE(D, I2_THREADS), S), I2_THREADS, 0, stream>>>(
+        (const float*) x.data_ptr(), (const float*) m.data_ptr(), (const float*) g.data_ptr(),
+        (const float*) wf.data_ptr(), (const float*) wg.data_ptr(), (float*) out.data_ptr(), D, r);
+    cuda_check(cudaPeekAtLastError());
+}
+
+// ---------------------------------------------------------------------------------------------------------------
+// Attention for one query
+
+#define I2A_THREADS 256
+#define I2A_KB 32               // keys per block
+#define I2A_PARTS 8             // threads per key in the score stage (I2A_THREADS / I2A_KB)
+#define I2A_MAX_G 4
+#define I2A_MAX_DH 128
+#define I2A_MDIMS 16            // value dimensions per merge block
+
+// A GPU thread is slow at long serial chains, so a block takes few keys and splits every sum over many threads:
+// 8 threads per key for the scores, 2 threads per value dimension for the weighted sums.
+__launch_bounds__(I2A_THREADS)
+__global__ void i2_attn_part_kernel
+(
+    const float* q,
+    const float* rel,
+    const float* __restrict__ proj,
+    const half* __restrict__ k_store,
+    const half* __restrict__ v_store,
+    const int64_t* __restrict__ pages,
+    const int64_t* __restrict__ ctl,
+    float* __restrict__ part,
+    const int G,
+    const int Hk,
+    const int dh,
+    const int dr,
+    const int extent,
+    const int blocks,
+    const bool local,
+    const int64_t base,
+    const int64_t window,
+    const float scale
+)
+{
+    __shared__ float qs[I2A_MAX_G][I2A_MAX_DH];
+    __shared__ float pd[I2A_MAX_G][I2A_THREADS];
+    __shared__ float scs[I2A_MAX_G][I2A_KB];
+    __shared__ int64_t rows[I2A_KB];
+
+    const int hk = blockIdx.x, b = blockIdx.y, tok = blockIdx.z, t = threadIdx.x;
+    const int H = Hk * G;
+    const int64_t pos = ctl[0] + tok, cpos = ctl[1] + tok;      // this token's position and sliding-buffer row
+    const int64_t n = local ? min(pos + 1, window) : pos + 1;
+    float* po = part + (((size_t) tok * Hk + hk) * blocks + b) * G * (2 + dh);
+    q += (size_t) tok * H * dh;
+    rel += (size_t) tok * H * dr;
+    if ((int64_t) b * I2A_KB >= n)
+    {
+        if (t < G) { po[(size_t) t * (2 + dh)] = -INFINITY; po[(size_t) t * (2 + dh) + 1] = 0.0f; }
+        return;
+    }
+    for (int i = t; i < G * dh; i += I2A_THREADS) qs[i / dh][i % dh] = q[(size_t) hk * G * dh + i];
+    __syncthreads();
+
+    // Scores: thread t takes key t / 8 and one eighth of its dimensions
+    const int key = t / I2A_PARTS, pt = t % I2A_PARTS;
+    const int64_t j = (int64_t) b * I2A_KB + key;
+    const bool valid = j < n;
+    const int64_t d = n - 1 - j;
+    const int64_t p = pos - d;
+    const int64_t row = !valid ? 0 : (local ? cpos - d : (pages ? pages[p >> 8] * 256 + (p & 255) : base + p));
+    float s[I2A_MAX_G];
+    for (int g = 0; g < G; ++g) s[g] = 0.0f;
+    if (valid)
+    {
+        const int span = dh / I2A_PARTS;
+        const half* kp = k_store + ((size_t) row * Hk + hk) * dh + pt * span;
+        for (int i = 0; i < span; ++i)
+        {
+            const float kv = __half2float(kp[i]);
+            for (int g = 0; g < G; ++g) s[g] += qs[g][pt * span + i] * kv;
+        }
+    }
+    for (int g = 0; g < G; ++g) pd[g][t] = s[g];
+    __syncthreads();
+    if (pt == 0)
+    {
+        rows[key] = row;
+        for (int g = 0; g < G; ++g)
+        {
+            float v = -INFINITY;
+            if (valid)
+            {
+                v = 0.0f;
+                for (int e = 0; e < I2A_PARTS; ++e) v += pd[g][t + e];
+                v *= scale;
+                if (d < extent)
+                {
+                    const float* rp = rel + (size_t) (hk * G + g) * dr;
+                    float bias = 0.0f;
+                    for (int r = 0; r < dr; ++r) bias += rp[r] * proj[(size_t) r * extent + d];
+                    v += bias;
+                }
+            }
+            scs[g][key] = v;
+        }
+    }
+    __syncthreads();
+
+    // Block maximum, exponentials and their sum: one thread per head over the 32 keys
+    if (t < G)
+    {
+        float m = -INFINITY;
+        for (int kk = 0; kk < I2A_KB; ++kk) m = fmaxf(m, scs[t][kk]);
+        float den = 0.0f;
+        for (int kk = 0; kk < I2A_KB; ++kk)
+        {
+            const float e = expf(scs[t][kk] - m);
+            scs[t][kk] = e;
+            den += e;
+        }
+        po[(size_t) t * (2 + dh)] = m;
+        po[(size_t) t * (2 + dh) + 1] = den;
+    }
+    __syncthreads();
+
+    // Weighted value sums: thread t takes dimension t % dh and every (threads / dh)-th key
+    const int chains = I2A_THREADS / dh;
+    const int dim = t % dh, chain = t / dh;
+    float acc[I2A_MAX_G];
+    for (int g = 0; g < G; ++g) acc[g] = 0.0f;
+    const int nk = (int) min((int64_t) I2A_KB, n - (int64_t) b * I2A_KB);
+    for (int kk = chain; kk < nk; kk += chains)
+    {
+        const float vv = __half2float(v_store[((size_t) rows[kk] * Hk + hk) * dh + dim]);
+        for (int g = 0; g < G; ++g) acc[g] += scs[g][kk] * vv;
+    }
+    for (int g = 0; g < G; ++g) pd[g][t] = acc[g];
+    __syncthreads();
+    if (t < dh)
+        for (int g = 0; g < G; ++g)
+        {
+            float v = 0.0f;
+            for (int c = 0; c < chains; ++c) v += pd[g][c * dh + t];
+            po[(size_t) g * (2 + dh) + 2 + t] = v;
+        }
+}
+
+// Merge of a head's blocks with the sink: one block per (head, 16 value dimensions)
+__launch_bounds__(I2A_THREADS)
+__global__ void i2_attn_merge_kernel
+(
+    const float* __restrict__ part,
+    const float* __restrict__ sinks,
+    const int64_t* __restrict__ ctl,
+    float* out,
+    const int G,
+    const int Hk,
+    const int dh,
+    const int blocks,
+    const bool local,
+    const int64_t window
+)
+{
+    __shared__ float red[I2A_THREADS];
+    __shared__ float stat[2];
+    const int h = blockIdx.x, tok = blockIdx.z, t = threadIdx.x;
+    const int hk = h / G, g = h % G;
+    const int64_t pos = ctl[0] + tok;
+    const int64_t n = local ? min(pos + 1, window) : pos + 1;
+    const int nb = (int) ((n + I2A_KB - 1) / I2A_KB);
+    const float* pb = part + ((((size_t) tok * Hk + hk) * blocks) * G + g) * (2 + dh);
+    const size_t step = (size_t) G * (2 + dh);
+    const float sink = sinks[(size_t) tok * Hk * G + h];
+    out += (size_t) tok * Hk * G * dh;
+
+    float mx = -INFINITY;
+    for (int b = t; b < nb; b += I2A_THREADS) mx = fmaxf(mx, pb[b * step]);
+    red[t] = mx;
+    __syncthreads();
+    for (int stride = I2A_THREADS / 2; stride > 0; stride >>= 1)
+    {
+        if (t < stride) red[t] = fmaxf(red[t], red[t + stride]);
+        __syncthreads();
+    }
+    if (t == 0) stat[0] = fmaxf(red[0], sink);
+    __syncthreads();
+    mx = stat[0];
+
+    float den = 0.0f;
+    for (int b = t; b < nb; b += I2A_THREADS) den += expf(pb[b * step] - mx) * pb[b * step + 1];
+    red[t] = den;
+    __syncthreads();
+    for (int stride = I2A_THREADS / 2; stride > 0; stride >>= 1)
+    {
+        if (t < stride) red[t] += red[t + stride];
+        __syncthreads();
+    }
+    if (t == 0) stat[1] = red[0] + expf(sink - mx);
+    __syncthreads();
+    den = stat[1];
+
+    const int chains = I2A_THREADS / I2A_MDIMS;
+    const int dl = t % I2A_MDIMS, chain = t / I2A_MDIMS;
+    const int dim = blockIdx.y * I2A_MDIMS + dl;
+    float v = 0.0f;
+    if (dim < dh)
+        for (int b = chain; b < nb; b += chains) v += expf(pb[b * step] - mx) * pb[b * step + 2 + dim];
+    red[t] = v;
+    __syncthreads();
+    if (t < I2A_MDIMS && dim < dh)
+    {
+        float sum = 0.0f;
+        for (int c = 0; c < chains; ++c) sum += red[c * I2A_MDIMS + t];
+        out[(size_t) h * dh + dim] = sum / den;
+    }
+}
+
+void i2_attn_one
+(
+    const at::Tensor& q,
+    const at::Tensor& rel,
+    const at::Tensor& sinks,
+    const at::Tensor& proj,
+    const at::Tensor& k_store,
+    const at::Tensor& v_store,
+    const c10::optional<at::Tensor>& pages,
+    const at::Tensor& ctl,
+    at::Tensor part,
+    at::Tensor out,
+    bool local,
+    int64_t base,
+    int64_t window,
+    int64_t capacity,
+    float scale
+)
+{
+    const at::cuda::OptionalCUDAGuard device_guard(q.device());
+    cudaStream_t stream = at::cuda::getCurrentCUDAStream().stream();
+    TORCH_CHECK(q.dim() == 3 && q.scalar_type() == at::kFloat && q.is_contiguous(), "i2_attn_one: q must be [S, H, dh]");
+    const int S = (int) q.size(0), H = (int) q.size(1), dh = (int) q.size(2);
+    TORCH_CHECK(k_store.scalar_type() == at::kHalf && v_store.scalar_type() == at::kHalf, "i2_attn_one: K/V dtype");
+    TORCH_CHECK(k_store.is_contiguous() && v_store.is_contiguous() && k_store.dim() >= 3, "i2_attn_one: K/V layout");
+    const int Hk = (int) k_store.size(-2);
+    TORCH_CHECK(k_store.size(-1) == dh && H % Hk == 0, "i2_attn_one: heads");
+    const int G = H / Hk;
+    TORCH_CHECK(G <= I2A_MAX_G && dh <= I2A_MAX_DH && I2A_THREADS % dh == 0 && dh % I2A_PARTS == 0, "i2_attn_one: geometry");
+    TORCH_CHECK(rel.dim() == 3 && rel.size(0) == S && rel.size(1) == H && rel.scalar_type() == at::kFloat && rel.is_contiguous(), "i2_attn_one: rel");
+    const int dr = (int) rel.size(2);
+    TORCH_CHECK(proj.dim() == 2 && proj.size(0) == dr && proj.scalar_type() == at::kFloat && proj.is_contiguous(), "i2_attn_one: proj");
+    const int extent = (int) proj.size(1);
+    TORCH_CHECK(sinks.numel() == (int64_t) S * H && sinks.scalar_type() == at::kFloat && sinks.is_contiguous(), "i2_attn_one: sinks");
+    TORCH_CHECK(out.numel() == (int64_t) S * H * dh && out.scalar_type() == at::kFloat && out.is_contiguous(), "i2_attn_one: out");
+    TORCH_CHECK(ctl.scalar_type() == at::kLong && ctl.numel() >= 2, "i2_attn_one: ctl");
+    const int blocks = (int) CEIL_DIVIDE(local ? window : capacity, (int64_t) I2A_KB);
+    TORCH_CHECK(part.scalar_type() == at::kFloat && part.numel() >= (int64_t) S * Hk * blocks * G * (2 + dh), "i2_attn_one: part");
+    const int64_t* pp = nullptr;
+    if (pages.has_value())
+    {
+        TORCH_CHECK(pages.value().scalar_type() == at::kLong, "i2_attn_one: pages");
+        pp = (const int64_t*) pages.value().data_ptr();
+    }
+    dim3 grid(Hk, blocks, S);
+    i2_attn_part_kernel<<<grid, I2A_THREADS, 0, stream>>>(
+        (const float*) q.data_ptr(), (const float*) rel.data_ptr(), (const float*) proj.data_ptr(),
+        (const half*) k_store.data_ptr(), (const half*) v_store.data_ptr(), pp, (const int64_t*) ctl.data_ptr(),
+        (float*) part.data_ptr(), G, Hk, dh, dr, extent, blocks, local, base, window, scale);
+    dim3 mgrid(H, CEIL_DIVIDE(dh, I2A_MDIMS), S);
+    i2_attn_merge_kernel<<<mgrid, I2A_THREADS, 0, stream>>>(
+        (const float*) part.data_ptr(), (const float*) sinks.data_ptr(), (const int64_t*) ctl.data_ptr(),
+        (float*) out.data_ptr(), G, Hk, dh, blocks, local, window);
+    cuda_check(cudaPeekAtLastError());
+}
+
+
+// ---------------------------------------------------------------------------------------------------------------
+// Q / K / V post-processing: one block per query head; the first Hk blocks also take a K / V head
+
+#define I2Q_THREADS 128
+
+__launch_bounds__(I2Q_THREADS)
+__global__ void i2_qkv_post_kernel
+(
+    const half* q_lin,
+    const half* r_lin,
+    const float* k,
+    const float* v,
+    const float* __restrict__ q_scale,
+    const float* __restrict__ rel_scale,
+    half* __restrict__ k_store,
+    half* __restrict__ v_store,
+    const int64_t* __restrict__ pages,
+    const int64_t* __restrict__ ctl,
+    float* q_out,
+    float* rel_out,
+    const int Hk,
+    const int dh,
+    const int dr,
+    const bool local,
+    const int64_t base,
+    const float qk_clip,
+    const float rel_clip,
+    const float log_alpha,
+    const float log_n_floor,
+    const float eps
+)
+{
+    __shared__ float red[4][I2Q_THREADS];
+    __shared__ float f[4];
+    const int h = blockIdx.x, tok = blockIdx.y, t = threadIdx.x;
+    const int H = gridDim.x;
+    const bool kv = h < Hk;
+    q_lin += (size_t) tok * H * dh; r_lin += (size_t) tok * H * dr;
+    k += (size_t) tok * Hk * dh; v += (size_t) tok * Hk * dh;
+    q_out += (size_t) tok * H * dh; rel_out += (size_t) tok * H * dr;
+    const float qv = t < dh ? __half2float(q_lin[h * dh + t]) * q_scale[h * dh + t] : 0.0f;
+    const float rv = t < dr ? __half2float(r_lin[h * dr + t]) * rel_scale[h * dr + t] : 0.0f;
+    const float kk = kv && t < dh ? k[h * dh + t] : 0.0f;
+    const float vv = kv && t < dh ? v[h * dh + t] : 0.0f;
+    red[0][t] = qv * qv; red[1][t] = rv * rv; red[2][t] = kk * kk; red[3][t] = vv * vv;
+    __syncthreads();
+    for (int stride = I2Q_THREADS / 2; stride > 0; stride >>= 1)
+    {
+        if (t < stride)
+            for (int s = 0; s < 4; ++s) red[s][t] += red[s][t + stride];
+        __syncthreads();
+    }
+    if (t == 0)
+    {
+        const float pos = (float) (ctl[0] + tok);
+        const float tau = log_n_floor > 0.0f ? 1.0f + log_alpha * logf(fmaxf((pos + 1.0f) / log_n_floor, 1.0f)) : 1.0f;
+        f[0] = fminf(qk_clip / (sqrtf(red[0][0]) + 1e-6f), 1.0f) * tau;
+        f[1] = fminf(rel_clip / (sqrtf(red[1][0]) + 1e-6f), 1.0f) * tau;
+        f[2] = fminf(qk_clip / (sqrtf(red[2][0]) + 1e-6f), 1.0f);
+        f[3] = rsqrtf(red[3][0] / (float) dh + eps);
+    }
+    __syncthreads();
+    if (t < dh) q_out[h * dh + t] = qv * f[0];
+    if (t < dr) rel_out[h * dr + t] = rv * f[1];
+    if (kv && t < dh)
+    {
+        const int64_t pos = ctl[0] + tok;
+        const int64_t row = local ? ctl[1] + tok : (pages ? pages[pos >> 8] * 256 + (pos & 255) : base + pos);
+        k_store[((size_t) row * Hk + h) * dh + t] = __float2half_rn(kk * f[2]);
+        v_store[((size_t) row * Hk + h) * dh + t] = __float2half_rn(vv * f[3]);
+    }
+}
+
+void i2_qkv_post
+(
+    const at::Tensor& q_lin,
+    const at::Tensor& r_lin,
+    const at::Tensor& k,
+    const at::Tensor& v,
+    const at::Tensor& q_scale,
+    const at::Tensor& rel_scale,
+    at::Tensor k_store,
+    at::Tensor v_store,
+    const c10::optional<at::Tensor>& pages,
+    const at::Tensor& ctl,
+    at::Tensor q_out,
+    at::Tensor rel_out,
+    bool local,
+    int64_t base,
+    float qk_clip,
+    float rel_clip,
+    float log_alpha,
+    float log_n_floor,
+    float eps
+)
+{
+    const at::cuda::OptionalCUDAGuard device_guard(q_lin.device());
+    cudaStream_t stream = at::cuda::getCurrentCUDAStream().stream();
+    TORCH_CHECK(q_scale.dim() == 2 && q_scale.scalar_type() == at::kFloat && q_scale.is_contiguous(), "i2_qkv_post: q_scale");
+    const int H = (int) q_scale.size(0), dh = (int) q_scale.size(1);
+    TORCH_CHECK(rel_scale.dim() == 2 && rel_scale.size(0) == H && rel_scale.scalar_type() == at::kFloat && rel_scale.is_contiguous(), "i2_qkv_post: rel_scale");
+    const int dr = (int) rel_scale.size(1);
+    TORCH_CHECK(dh <= I2Q_THREADS && dr <= I2Q_THREADS, "i2_qkv_post: head size");
+    TORCH_CHECK(k_store.scalar_type() == at::kHalf && v_store.scalar_type() == at::kHalf && k_store.dim() >= 3, "i2_qkv_post: stores");
+    const int Hk = (int) k_store.size(-2);
+    TORCH_CHECK(k_store.size(-1) == dh && Hk <= H && k_store.is_contiguous() && v_store.is_contiguous(), "i2_qkv_post: store layout");
+    TORCH_CHECK(q_lin.dim() == 2, "i2_qkv_post: q_lin must be [S, H * dh]");
+    const int S = (int) q_lin.size(0);
+    TORCH_CHECK(q_lin.scalar_type() == at::kHalf && q_lin.numel() == (int64_t) S * H * dh && q_lin.is_contiguous(), "i2_qkv_post: q_lin");
+    TORCH_CHECK(r_lin.scalar_type() == at::kHalf && r_lin.numel() == (int64_t) S * H * dr && r_lin.is_contiguous(), "i2_qkv_post: r_lin");
+    TORCH_CHECK(k.scalar_type() == at::kFloat && k.numel() == (int64_t) S * Hk * dh && k.is_contiguous(), "i2_qkv_post: k");
+    TORCH_CHECK(v.scalar_type() == at::kFloat && v.numel() == (int64_t) S * Hk * dh && v.is_contiguous(), "i2_qkv_post: v");
+    TORCH_CHECK(q_out.scalar_type() == at::kFloat && q_out.numel() == (int64_t) S * H * dh && q_out.is_contiguous(), "i2_qkv_post: q_out");
+    TORCH_CHECK(rel_out.scalar_type() == at::kFloat && rel_out.numel() == (int64_t) S * H * dr && rel_out.is_contiguous(), "i2_qkv_post: rel_out");
+    TORCH_CHECK(ctl.scalar_type() == at::kLong && ctl.numel() >= 2, "i2_qkv_post: ctl");
+    const int64_t* pp = nullptr;
+    if (pages.has_value())
+    {
+        TORCH_CHECK(pages.value().scalar_type() == at::kLong, "i2_qkv_post: pages");
+        pp = (const int64_t*) pages.value().data_ptr();
+    }
+    i2_qkv_post_kernel<<<dim3(H, S), I2Q_THREADS, 0, stream>>>(
+        (const half*) q_lin.data_ptr(), (const half*) r_lin.data_ptr(), (const float*) k.data_ptr(), (const float*) v.data_ptr(),
+        (const float*) q_scale.data_ptr(), (const float*) rel_scale.data_ptr(), (half*) k_store.data_ptr(),
+        (half*) v_store.data_ptr(), pp, (const int64_t*) ctl.data_ptr(), (float*) q_out.data_ptr(), (float*) rel_out.data_ptr(),
+        Hk, dh, dr, local, base, qk_clip, rel_clip, log_alpha, log_n_floor, eps);
+    cuda_check(cudaPeekAtLastError());
+}

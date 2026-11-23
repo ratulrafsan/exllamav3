@@ -6,6 +6,9 @@
 // Non-gated relu2 (NemotronH): the g input is unused (its GEMM is skipped by the caller); the
 // gate lane is set to relu(u) so the gate multiply below yields relu(u) * u = relu^2(u) exactly
 #define ACT_RELU2_NOGATE 2
+// Local patch, Inkling-2 (act_limit < 0): softcap(g, 4) * sigmoid(g) * softcap(u, 25). The gpt-oss swiglu is not
+// implemented in this kernel
+#define ACT_SILU_OAI 3
 
 // Hadamard transform 128-element vector across one warp, with optional pre and post scales
 
@@ -376,6 +379,21 @@ void had_hf_r_128_guad_inner
             vg.y = _gelu(vg.y);
             break;
 
+        case ACT_SILU_OAI:
+        {
+            float2 gf = __half22float2(vg.x), uf = __half22float2(vu.x);
+            gf.x = (4.0f * tanhf(gf.x * 0.25f)) * (1.0f / (1.0f + __expf(-gf.x))) * (25.0f * tanhf(uf.x * 0.04f));
+            gf.y = (4.0f * tanhf(gf.y * 0.25f)) * (1.0f / (1.0f + __expf(-gf.y))) * (25.0f * tanhf(uf.y * 0.04f));
+            vg.x = __float22half2_rn(gf);
+            gf = __half22float2(vg.y); uf = __half22float2(vu.y);
+            gf.x = (4.0f * tanhf(gf.x * 0.25f)) * (1.0f / (1.0f + __expf(-gf.x))) * (25.0f * tanhf(uf.x * 0.04f));
+            gf.y = (4.0f * tanhf(gf.y * 0.25f)) * (1.0f / (1.0f + __expf(-gf.y))) * (25.0f * tanhf(uf.y * 0.04f));
+            vg.y = __float22half2_rn(gf);
+            vu.x = __float2half2_rn(1.0f);
+            vu.y = __float2half2_rn(1.0f);
+            break;
+        }
+
         case ACT_RELU2_NOGATE:
             vg.x = __hmax2(vu.x, __float2half2_rn(0.0f));
             vg.y = __hmax2(vu.y, __float2half2_rn(0.0f));
@@ -386,7 +404,7 @@ void had_hf_r_128_guad_inner
     }
 
     // Optional activation limits
-    if (act_limit != 0.0f)
+    if (act_limit != 0.0f && act_function != ACT_SILU_OAI)
     {
         vu.x = __hmax2(vu.x, __float2half2_rn(-act_limit));
         vu.y = __hmax2(vu.y, __float2half2_rn(-act_limit));

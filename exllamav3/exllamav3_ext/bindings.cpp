@@ -10,6 +10,7 @@
 
 #include "norm.cuh"
 #include "hgemm.cuh"
+#include "inkling2.cuh"
 #include "turing/fa75.cuh"
 #include "rope.cuh"
 #include "activation.cuh"
@@ -251,6 +252,13 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
     m.def("mul_softplus_broadcast_", &mul_softplus_broadcast_, "mul_softplus_broadcast_");
     m.def("add_sigmoid_gate_proj", &add_sigmoid_gate_proj, "add_sigmoid_gate_proj");
     m.def("add", &add, "add");
+    // Local patch: Inkling-2 decode-step kernels
+    m.def("i2_conv_step", &i2_conv_step, "i2_conv_step");
+    m.def("i2_attn_res", &i2_attn_res, "i2_attn_res");
+    m.def("i2_message_gate", &i2_message_gate, "i2_message_gate");
+    m.def("i2_attn_one", &i2_attn_one, "i2_attn_one");
+    m.def("i2_qkv_post", &i2_qkv_post, "i2_qkv_post");
+
 
     m.def("gated_delta_net_fused_op", &gated_delta_net_fused_op, "gated_delta_net_fused_op");
     m.def("gated_delta_net_fused_op_2", &gated_delta_net_fused_op_2, "gated_delta_net_fused_op_2");

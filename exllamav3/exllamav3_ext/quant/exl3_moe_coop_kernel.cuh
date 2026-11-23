@@ -100,6 +100,9 @@ __device__ __forceinline__ float act_relu2(float x)
 // sigmoid and +1 on the up path
 __device__ __forceinline__ float act_oai_swiglu(float g, float u, float limit)
 {
+    // Local patch, Inkling-2 (limit < 0): softcap(g, 4) * sigmoid(g) * softcap(u, 25)
+    if (limit < 0.0f)
+        return (4.0f * tanhf(g * 0.25f)) * (1.0f / (1.0f + __expf(-g))) * (25.0f * tanhf(u * 0.04f));
     if (limit != 0.0f)
     {
         g = fminf(g, limit);

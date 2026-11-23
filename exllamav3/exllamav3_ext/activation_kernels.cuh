@@ -119,6 +119,9 @@ __device__ __forceinline__ float _sigmoid_fast_exp(float x)
 // the activation, alpha = 1.702 inside the sigmoid and +1 on the up path
 __device__ __forceinline__ float _oai_swiglu(float g, float u, const float limit)
 {
+    // Local patch, Inkling-2 (limit < 0): softcap(g, 4) * sigmoid(g) * softcap(u, 25)
+    if (limit < 0.0f)
+        return (4.0f * tanhf(g * 0.25f)) * _sigmoid_fast_exp(g) * (25.0f * tanhf(u * 0.04f));
     if (limit != 0.0f)
     {
         g = fminf(g, limit);

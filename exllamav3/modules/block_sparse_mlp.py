@@ -532,7 +532,9 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
         # per-expert path, which handles all of them (gpt-oss)
         self.support_quant_paths = (
             self.is_quantized and
-            (self.activation_fn in ("silu", "gelu") if self.gated else self.activation_fn == "relu2") and
+            # Local patch: the Inkling-2 activation (swiglu_oai with act_limit < 0) is in the kernels too
+            (self.activation_fn in ("silu", "gelu") or (self.activation_fn == "swiglu_oai" and self.act_limit < 0)
+             if self.gated else self.activation_fn == "relu2") and
             all(l.inner.bias is None for l in self.gates + self.ups + self.downs) and
             all(not l.trim_padded_out or l.out_features == l.out_features_unpadded for l in self.downs)
         )

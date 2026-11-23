@@ -52,6 +52,7 @@ The settings for this system are in the TabbyAPI configuration and start script.
 | Pipelined prefill with CPU experts | Lets the two GPUs work on different prefill chunks when the CPU expert split is on. This is a port of [a commit by Auryn Macmillan](https://github.com/auryn-macmillan/exllamav3/commit/b38de78bd0376fcdc4f92344ed405800ac8374b6). The port also adds a lock to the n-gram row table. Prefill of prompts longer than one chunk is approximately 10% faster. `EXL3_PIPELINED_PREFILL=0` turns it off. |
 | Late promote hook | Moves the promote-on-miss step off the critical path of decode and makes its budget a setting. Decode is approximately 17% faster on this system. Refer to [Late promote hook](#late-promote-hook). |
 | Expert lookahead (experimental, off by default) | Predicts the experts of the next split layer and copies them from RAM to VRAM before the layer needs them. It needs a source build of the extension. On this system it makes decode slower. Refer to [Expert lookahead](#expert-lookahead). |
+| Inkling-2-Mini (work in progress) | Adds the looped Inkling-2 text model: load from the source checkpoint or from an EXL3 conversion of its experts, cache, generator, CUDA-graph decode and decode kernels. It needs a source build of the extension for full speed. Refer to [Inkling-2-Mini](#inkling-2-mini). |
 
 ### Late promote hook
 
@@ -209,6 +210,152 @@ These are estimates. They are not tested.
 - No unit test covers the patch. The verify mode makes the checks after a synchronization, so it does not test the order of operations.
 - The output quality is not graded. More experts move between the CPU and the GPU during a generation than without the patch.
 - The patch does not use a trained correction of the prediction. On a recorded session, a correction increased the part of the CPU experts that the prediction finds from 59% to 69%.
+
+### Inkling-2-Mini
+
+> [!WARNING]
+> This is work in progress. Text input only. The multi-token-prediction (MTP) head and the vision tower are not implemented.
+
+#### Overview
+
+[Inkling-2-Mini](https://huggingface.co/thinkingmachines/Inkling-2-Mini) is a 26.4B-parameter MoE model from Thinking Machines. It is a looped transformer:
+
+- The model has 24 layers of weights. Layers 6 to 17 run three times for each token, so a token goes through 48 layer applications.
+- Passes 2 and 3 start again from the hidden state before the loop. They receive "messages" from the pass before, mixed in through small gates.
+- Attention has no RoPE. It uses a relative position bias computed from the hidden state, a sink logit for each token, and short convolutions on K, V and the layer outputs.
+- 20 layers use a sliding window of 1,024 tokens. 4 layers are global.
+- Each layer has 128 experts with 8 active for each token.
+
+This fork adds the architecture `Inkling2LoopForConditionalGeneration`. It is not in upstream exllamav3.
+
+The layer math and the NVFP4 / MXFP8 dequantizers are adapted from [0xSero/inkling2-exl3](https://github.com/0xSero/inkling2-exl3) (MIT), which supports the larger Inkling-2-Small without the loop. The design of the decode step (graph replay, split attention) follows the notes of [ashalliants/ninfer-3090](https://github.com/ashalliants/ninfer-3090) (Apache 2.0).
+
+#### Current state
+
+| Item | State |
+|---|---|
+| Load from the source checkpoint (experts stay in NVFP4 / MXFP8) | Works. 17.6 GiB of VRAM. Slow: approximately 6 T/s. |
+| EXL3 conversion of the experts | Works. Refer to [Convert the model](#convert-the-model). |
+| Cache, generator, tabbyAPI | Works. Each loop pass has its own cache layers. FP16 cache only. |
+| Context length | Tested with a 161,543-token prompt on the 3090 + 4090. |
+| Decode as CUDA graph replays, with decode kernels | Works for one sequence with EXL3 experts. |
+| Multi-token graph steps (verify drafted tokens) | Works for a maximum of 8 tokens in one forward pass. Nothing uses them yet. |
+| Prefill | Plain PyTorch (cuBLAS). |
+| MTP head (`mtp.safetensors`) | Not implemented. |
+| Vision | Not implemented. |
+| Tensor parallelism | Not supported. |
+
+#### Requirements
+
+- **A source build of the extension for full speed.** The patch adds CUDA kernels (`exllamav3/exllamav3_ext/inkling2.cu`) and the Inkling-2 activation in the expert kernels. The release wheels do not contain them. With a wheel, the model gives correct results on a slow path, and the log shows a line that starts with ` !! Inkling2:`.
+- **The native CUDA allocator.** CUDA graph capture does not work with `cudaMallocAsync`. In tabbyAPI, set `cuda_malloc_async: false`. With the async allocator the model decodes without graphs and shows a `!!` line.
+- **The FP16 cache.** Quantized cache modes are not supported.
+- **A GPU split with free memory.** Attention on the global layers needs working memory that grows with the context. On this system, tabbyAPI uses `autosplit_reserve: [3072, 1024]`.
+
+Build the extension with:
+
+```
+# in the root of this repository
+python setup.py build_ext --build-lib ../exl3_build/lib --build-temp ../exl3_build/tmp
+```
+
+Then put `exl3_build/lib` first on `PYTHONPATH`.
+
+#### Convert the model
+
+The source checkpoint has the experts only in NVFP4 (layers 0 to 19) and MXFP8 (layers 20 to 23). There is no full-precision release. The stock converter (`convert.py`) cannot run a looped model, so the conversion has its own script:
+
+```
+python util/inkling2/convert_exl3.py <source dir> <output dir> --work <work dir> --rows 250 --bits 6 --bits-mx 8
+```
+
+- The script quantizes the experts only (93% of the parameters). All other tensors stay as in the checkpoint.
+- The calibration pass collects the Hessians of each expert over all three loop passes. There is no error propagation between layers.
+- The conversion takes approximately 65 minutes on this system. The work directory needs approximately 60 GB. You can delete it after the conversion.
+- The result at 6 bpw (8 bpw for the MXFP8 layers) is 23 GB on disk and uses 21.2 GiB of VRAM.
+
+Quality against the source checkpoint over 20,480 tokens (`util/inkling2/quality_check.py`):
+
+| Model | KL | Top-1 agreement | Perplexity |
+|---|---|---|---|
+| Source checkpoint (reference) | - | - | 8.4444 |
+| Source checkpoint with bf16 activations (noise floor) | 0.00245 | 97.64% | 8.4478 |
+| EXL3, 6 bpw | 0.00282 | 97.49% | 8.4452 |
+
+> [!NOTE]
+> The top-k expert routing of this model is discontinuous. Two runs that differ only by rounding give logits that differ by 2 to 3%. The "noise floor" line shows this effect. Do not compare outputs token by token without it.
+
+#### Settings
+
+| Variable | Value | Default |
+|---|---|---|
+| `EXL3_I2_GRAPH` | `0` runs each decode step operation by operation, without CUDA graphs. | `1` |
+| `EXL3_I2_GRAPH_WIDTH` | The maximum number of tokens of one sequence in one forward pass that runs as a graph. | `8` |
+| `EXL3_I2_KERNELS` | `0` uses the PyTorch forms in the graph and not the decode kernels. | `1` |
+| `EXL3_I2_MOE` | `dense` runs the EXL3 experts in a slow reference loop. Use it to compare with `kernel`. | `kernel` |
+| `EXL3_I2_ADT` | The activation data type: `fp16`, `bf16` or `fp32`. The decode kernels need `fp16`. | `fp16` |
+| `EXL3_I2_NAN_CHECK` | `1` shows a line when a forward pass gives logits that are not finite. | `0` |
+
+#### Test results
+
+All results are for the EXL3 conversion on the RTX 4090 + RTX 3090, one sequence.
+
+Decode (`util/inkling2/graph_check.py`):
+
+| Context (tokens) | Operation by operation | CUDA graph with kernels |
+|---|---|---|
+| 600 | 26 T/s | 72 T/s |
+| 2,000 | 26 T/s | 71 T/s |
+| 9,000 | 26 T/s | 67 T/s |
+| 30,000 | 25 T/s | 59 T/s |
+
+Forward passes with more than one token of one sequence (`util/inkling2/graph_spec_check.py`):
+
+| Tokens | Operation by operation | Graph |
+|---|---|---|
+| 1 | 40.4 ms | 14.5 ms |
+| 2 | 61.3 ms | 18.5 ms |
+| 4 | 61.6 ms | 23.1 ms |
+| 8 | 61.8 ms | 30.0 ms |
+
+Through tabbyAPI:
+
+| Test | Result |
+|---|---|
+| Short chats and tool calls | Approximately 65 T/s |
+| 9K-token prompt | Prefill 1,751 T/s, decode 61 T/s |
+| 44K-token prompt | Prefill 1,068 T/s |
+| 161,543-token prompt (older build, before the graph and kernel work) | Prefill 183 T/s, decode 12.9 T/s, correct answer to a question about a sentence at 10% depth |
+
+#### How the patch works
+
+- `exllamav3/modules/inkling2.py` has the model in plain PyTorch. It is the reference, and it runs prefill.
+- `exllamav3/architecture/inkling2_loop.py` has the modules, the cache state and the graph code. The loop uses the layer map of exllamav3: the looped layers occur three times in the forward order, and each occurrence has its own cache layers.
+- The global layers keep K/V in the paged cache. The sliding layers keep the last window in a buffer for each sequence. All layers keep the last inputs of their convolutions in a ring.
+- A decode step is captured as one CUDA graph for each GPU. All cache indexes are computed on the GPU from two integers, so one captured graph is correct for all positions.
+- `exllamav3/exllamav3_ext/inkling2.cu` has five kernels that replace groups of small PyTorch operations in the graph: convolution, block attention residual, message gate, Q/K/V post-processing and attention.
+
+The checks in `util/inkling2/` compare the port with the transformers reference (`ref_dump.py`, `port_check.py`), cached decode with an uncached pass (`cache_check.py`) and graph decode with operation-by-operation decode (`graph_check.py`, `graph_seq_check.py`, `graph_spec_check.py`).
+
+#### Limits
+
+- Graph decode is for one sequence. Batches, prefill and forward passes wider than `EXL3_I2_GRAPH_WIDTH` run operation by operation.
+- Prefill at long context is slow. At 40K tokens of context, 84% of the prefill time is attention on the global layers.
+- The checkpoint of the cache state is approximately 162 MiB, because it holds the attention window of all sliding layer applications.
+- A few experts that the model uses rarely saw very little calibration data (a minimum of 1 token in layer 22).
+- On one 44K-token test prompt, graph decode and operation-by-operation decode gave different answers. All step-by-step comparisons agree, so this is the routing effect in the note above, but it is not proven for all prompts. `EXL3_I2_GRAPH=0` is the switch to compare.
+
+#### TODO
+
+1. **MTP head.** Load `mtp.safetensors`, read the hidden states of layer applications 5, 23, 41 and 48 (also in the graph), run the 3-layer draft block and its Markov head, and send the 7 drafted tokens through the multi-token graph step.
+2. **Prefill attention.** A kernel that uses tensor cores for the global layers. A scalar kernel was tested and was 3 to 5 times slower than cuBLAS.
+3. **Decode.** Tune the block attention residual and gate kernels, and replace the remaining small PyTorch operations. The expert kernel (approximately 4.4 ms of 14 ms for each token) and memory bandwidth set the limit after that.
+4. **Graph steps wider than 8 tokens**, for the n-gram draft verification of tabbyAPI (65 tokens).
+5. **Batched decode** as graphs.
+6. **Vision tower.**
+7. **Quantized cache modes** for the global layers.
+8. **Native NVFP4 expert kernels**, to run the source checkpoint without a conversion.
+9. **Conversion with the stock converter**, which needs support for looped models, and more calibration data for the rare experts.
 
 ### Control vectors
 
