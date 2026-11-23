@@ -1206,7 +1206,12 @@ class MoeCpuHost:
             # frombuffer rejects a buffer shorter than the advertised chunk
             view = torch.frombuffer(m.buf if name is not None else m, dtype = torch.int16,
                                     count = size // 2)
-            cuda_host_register(view.data_ptr(), size, flags = CUDA_HOST_REGISTER_PORTABLE)
+            # Local patch: the expert lookahead's upload kernel reads the arena directly, which needs
+            # the device mapping (EXL3_MOE_CPU_LOOKAHEAD, see modules/moe_lookahead.py)
+            flags = CUDA_HOST_REGISTER_PORTABLE
+            if int(os.environ.get("EXL3_MOE_CPU_LOOKAHEAD", 0)) > 0:
+                flags |= CUDA_HOST_REGISTER_MAPPED
+            cuda_host_register(view.data_ptr(), size, flags = flags)
         except Exception as e:
             view = None   # no tensor over an unmapped region may survive in the traceback's frame
             m.close()

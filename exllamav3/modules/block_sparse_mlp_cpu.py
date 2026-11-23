@@ -244,6 +244,20 @@ class _PromoteState:
         for m in self.modules:
             m._split_snap = None          # the per-module snapshot is superseded by the shared one
 
+        # Local patch: expert lookahead (modules/moe_lookahead.py). With it, promotions run in GPU kernels
+        # and this state only requests them, reads their completion log and issues the demotions
+        self.la = None
+        from . import moe_lookahead
+        if moe_lookahead.LOOKAHEAD > 0:
+            try:
+                self.la = moe_lookahead.Lookahead(self, _split_slot_linears)
+                n_pred = sum(1 for st in self.la.states if st.has_predictor)
+                print(f" -- Expert lookahead: on, {moe_lookahead.LOOKAHEAD} per layer per step, "
+                      f"{n_pred} of {len(self.modules)} split layers predicted", flush = True)
+            except RuntimeError as err:
+                self.la = None
+                print(f" !! Expert lookahead: off ({err})", flush = True)
+
 
 def _split_promote_step(ip, modules, rows):
     """One decode step of promote-on-miss for every split module (called from the first module's
@@ -267,7 +281,18 @@ def _split_promote_step(ip, modules, rows):
         ps = ip.moe_cpu_promote_state = _PromoteState(modules)
     verify = os.environ.get("EXL3_MOE_CPU_PROMOTE_VERIFY")
     debug = os.environ.get("EXL3_MOE_CPU_SWAP_DEBUG")
+    la = ps.la
     # (1) landed transfers
+    if la is not None:
+        # Lookahead: uploads the GPU committed since the last step (the map already points at their slots)
+        for i, r, c, g in la.drain_log():
+            m = ps.modules[i]
+            m._split_mp[r] = g
+            ps.mp[i, r] = g
+            m._split_free_cpu.append(c)
+            m._split_promo_n += 1
+            if verify:
+                _split_promote_verify(m, dict(kind = "p", r = r, gpu = g, cpu = c))
     for i, m in enumerate(ps.modules):
         if not m._split_pending:
             continue
@@ -283,8 +308,17 @@ def _split_promote_step(ip, modules, rows):
                 m._split_promo_n += 1
             else:
                 m._split_mp[r] = m.cpu_split_first + t["cpu"]
-                m._split_free_gpu.append(t["gpu"])
                 m._split_demo_n += 1
+                if la is not None:
+                    # The map flip, the worker slot's in-flight flag and the freed GPU slot go to the
+                    # device in one compute-stream op (flush_ops below)
+                    la.pending_ops[i].append((1, r, t["cpu"], t["gpu"]))
+                    ps.mp[i, r] = m._split_mp[r]
+                    ps.busy[i, r] = False
+                    if verify:
+                        _split_promote_verify(m, t)
+                    continue
+                m._split_free_gpu.append(t["gpu"])
             idx.append(r)
             val.append(m._split_mp[r])
             ps.busy[i, r] = False
@@ -309,6 +343,9 @@ def _split_promote_step(ip, modules, rows):
     have = bool(ps.snap_ev)
     for ev in ps.snap_ev.values():
         ev.synchronize()
+    if la is not None:
+        # Lookahead: the landed demotions' map flips and freed GPU slots, in compute-stream order
+        la.flush_ops()
     if have:
         cur = ps.snap_np.copy()
         routed = cur > ps.prev
@@ -341,6 +378,13 @@ def _split_promote_step(ip, modules, rows):
                     break
                 i, r = divmod(flat, ps.mp.shape[1])
                 m = ps.modules[i]
+                if la is not None:
+                    # Lookahead: the select kernel of the layer's next step takes the request (it checks
+                    # the map, the in-flight set and the free slots itself)
+                    if i not in seen:
+                        la.request(i, r)
+                        seen.add(i)
+                    continue
                 if i in seen or not m._split_free_gpu:
                     continue
                 host, first = m.cpu_host, m.cpu_split_first
@@ -355,6 +399,8 @@ def _split_promote_step(ip, modules, rows):
                 m._split_pending.append(dict(kind = "p", r = r, gpu = g, cpu = c, ev = ev))
                 ps.busy[i, r] = True
                 seen.add(i)
+        if la is not None:
+            la.flush_requests()
         # (4) demotions into the worker slots promotions freed: the least-used unrouted residents
         for i, m in enumerate(ps.modules):
             k = len(m._split_free_cpu)
@@ -388,8 +434,13 @@ def _split_promote_step(ip, modules, rows):
             print(f" -- promote-on-miss: step {modules[0]._split_step_count}, {p} promotions, {d} demotions, {pend} in flight; "
                   f"last {st['steps']} steps: {st['routed'] / st['steps']:.1f} routed/step, "
                   f"{st['missed'] / st['steps']:.1f} on the CPU ({100 * (1 - st['missed'] / max(st['routed'], 1)):.1f}% hit), "
-                  f"hook {1000 * st['ms'] / st['steps']:.2f} ms/step", flush = True)
+                  f"hook {1000 * st['ms'] / st['steps']:.2f} ms/step"
+                  + (f", lookahead {la.stats['uploads'] / st['steps']:.1f} uploads/step, "
+                     f"{la.stats['skipped'] / st['steps']:.1f} selects skipped/step" if la is not None else ""),
+                  flush = True)
             st.update(routed = 0, missed = 0, steps = 0, ms = 0.0)
+            if la is not None:
+                la.stats.update(uploads = 0, skipped = 0)
 
 
 def _split_slot_linears(m, g):
@@ -714,6 +765,7 @@ class BlockSparseMLP_CPU:
                 self._split_map = None
                 self._split_hist = None
                 self._split_pending = None
+                self._la = None
                 self.config.infer_params.moe_cpu_promote_state = None
         if self.cpu_offload:
             host = getattr(self, "cpu_host", None)
@@ -738,6 +790,14 @@ class BlockSparseMLP_CPU:
         if self._split_map is not None:
             self._split_submit_rows = bsz
             self._split_swap_tick()
+            la_st = getattr(self, "_la", None)
+            if la_st is not None:
+                # Local patch: expert lookahead (modules/moe_lookahead.py)
+                la = self.config.infer_params.moe_cpu_promote_state.la
+                if bsz < self.cpu_host.stream_min_rows:
+                    la.step(la_st, y, bsz)
+                else:
+                    la.quiesce()
             if self._split_spares and bsz >= self.cpu_host.stream_min_rows and self._split_pending:
                 # The streamed prefill's stager reads worker slots a demotion may still be writing:
                 # let the transfers land first (a prefill step is long anyway)

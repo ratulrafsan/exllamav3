@@ -51,6 +51,7 @@ The settings for this system are in the TabbyAPI configuration and start script.
 | Control vectors | Applies llama.cpp control vectors to the residual stream. Refer to [Control vectors](#control-vectors). |
 | Pipelined prefill with CPU experts | Lets the two GPUs work on different prefill chunks when the CPU expert split is on. This is a port of [a commit by Auryn Macmillan](https://github.com/auryn-macmillan/exllamav3/commit/b38de78bd0376fcdc4f92344ed405800ac8374b6). The port also adds a lock to the n-gram row table. Prefill of prompts longer than one chunk is approximately 10% faster. `EXL3_PIPELINED_PREFILL=0` turns it off. |
 | Late promote hook | Moves the promote-on-miss step off the critical path of decode and makes its budget a setting. Decode is approximately 17% faster on this system. Refer to [Late promote hook](#late-promote-hook). |
+| Expert lookahead (experimental, off by default) | Predicts the experts of the next split layer and copies them from RAM to VRAM before the layer needs them. It needs a source build of the extension. On this system it makes decode slower. Refer to [Expert lookahead](#expert-lookahead). |
 
 ### Late promote hook
 
@@ -112,6 +113,102 @@ The test uses the hardware in [Hardware and constraints](#hardware-and-constrain
 - `tests/moe_cpu/test_promote_step.py` was not run with this patch.
 - The patch is tested with one model, one workload and all split layers on one GPU.
 - The host time of the promote step increases with the budget. If the host time becomes longer than the time the GPU needs for the earlier layers, the GPU waits again.
+
+### Expert lookahead
+
+> [!WARNING]
+> **This patch is experimental, and it is off by default.** On the system in [Hardware and constraints](#hardware-and-constraints), it makes decode slower: 60 T/s with the patch and 75 T/s without it. The patch is in this branch because the result can be different on other hardware. It is not tested on other hardware.
+
+#### Overview
+
+With the CPU expert split, the CPU worker calculates each routed expert that is not in VRAM. The idea of this patch comes from [TokenWing](https://github.com/runmyai/tokenwing), which uses it to read experts from an SSD before a layer needs them. This patch uses the idea for the transfer from RAM to VRAM:
+
+1. While split layer L calculates, the router of layer L+1 runs on the router input of layer L. The result is a prediction of the experts that layer L+1 selects.
+2. A kernel selects the predicted experts that are in RAM and gives each one a free GPU slot.
+3. On a second CUDA stream, a kernel copies each of these experts from the pinned RAM arena to its GPU slot. A last kernel changes the placement map and writes the transfer to a log in pinned memory.
+4. Layer L+1 then finds these experts in VRAM. The experts stay in VRAM.
+5. The promote step of the host reads the log, and it moves less frequently used experts back to RAM to make free GPU slots.
+
+All transfers from RAM to VRAM go through these kernels when the patch is on. The promote step sends its own promotions to the kernels as requests. The host does not wait for the GPU in this procedure.
+
+#### Requirements
+
+- **A source build of the extension.** The patch adds CUDA kernels (`exllamav3/exllamav3_ext/cpu/moe_lookahead.cu`). The release wheels do not contain them. With a wheel, the setting has no effect, and the log shows `Expert lookahead: off (the extension has no moe_la_step ...)`.
+- The CPU expert split with the pinned arena (`EXL3_MOE_PINNED_ARENA=1`) and promote-on-miss.
+- All split layers on one GPU.
+- A router of the standard type, with no norm between the layer input and the router.
+
+To build the extension without a change to the installed package:
+
+```sh
+CUDA_HOME=/usr/local/cuda-13.0 python setup.py build_ext --build-lib ../exl3_build/lib --build-temp ../exl3_build/tmp
+PYTHONPATH=/path/to/exl3_build/lib:/path/to/this/checkout python main.py
+```
+
+#### Settings
+
+| Variable | Value | Default |
+|---|---|---|
+| `EXL3_MOE_CPU_LOOKAHEAD` | The maximum number of predicted experts that one split layer uploads for each decode step. `0` turns the patch off. | `0` (off) |
+| `EXL3_MOE_CPU_LOOKAHEAD_ROWS` | A forward pass with more rows than this value does not use predictions. | `4` |
+| `EXL3_MOE_CPU_LOOKAHEAD_BLOCKS` | The number of blocks of the upload kernel for each expert. `0` uses one block for each run of 8 tiles. This is the fastest upload. | `0` |
+| `EXL3_MOE_CPU_LOOKAHEAD_DRY` | `1` runs the predictor but uploads none of its experts. Use it to measure the cost of the predictor. | `0` |
+| `EXL3_MOE_CPU_PROMOTE` | The number of spare GPU slots for each split layer. This is a stock setting. The lookahead uses more free slots: the tests use `8` with a lookahead of 1 or 2, and `12` with a lookahead of 4. | `4` |
+
+When the patch is on, the log shows a line of this type:
+
+```
+ -- Expert lookahead: on, 2 per layer per step, 32 of 33 split layers predicted
+```
+
+With `EXL3_MOE_CPU_SWAP_DEBUG=1`, the promote-on-miss line also shows the number of uploads for each step.
+
+#### Test results
+
+The test uses the hardware in [Hardware and constraints](#hardware-and-constraints), with TabbyAPI, the late promote hook and a budget of 33. All runs use the extension from a source build. A run has 8 chat requests of 400 tokens. Each run uses a new server.
+
+| Condition | Decode (T/s) | Hit rate |
+|---|---|---|
+| Lookahead off, 2 runs | 75.0 / 75.1 | 76% |
+| Kernel transfers, no predictions (`EXL3_MOE_CPU_LOOKAHEAD_ROWS=0`) | 68.7 | 74% |
+| Predictor on, no uploads of its experts (`EXL3_MOE_CPU_LOOKAHEAD_DRY=1`) | 67.3 | 75% |
+| Lookahead 1 | 63.4 | 80% |
+| Lookahead 2, 2 runs | 60.3 / 60.4 | 82% |
+| Lookahead 4 | 55.2 | 84% |
+
+- **The patch does its function.** With a lookahead of 2, the hit rate is 86% to 89% after the cold start. The CPU worker calculates 0.99 experts for each row of a split layer, and 1.78 without the patch.
+- **The data is correct.** A test run with `EXL3_MOE_CPU_PROMOTE_VERIFY=1` compared 108,452 promotions and 108,383 demotions with the checkpoint. All were correct.
+- **Decode is slower.** The input of each split layer comes approximately 0.29 ms later to the CPU worker (0.52 ms and not 0.23 ms). This is more than the time that the worker saves (0.15 ms and not 0.22 ms for each layer).
+- **The predictor is not the cause.** It costs approximately 2%.
+
+The cause is the upload kernel. It reads the experts from mapped host memory. The kernels of the CPU hand-off also use mapped host memory: one kernel writes the layer input to a pinned slot, and one kernel reads the result. While an upload runs, these kernels wait. A test without the model shows the same effect (`upload_interference_bench.py` in the benchmark files of this system, which are not part of this repository). Beside 200 uploads, a stream of small kernels that use pinned memory is 17.3 ms slower with uploads from mapped memory. It is 3.5 ms slower with uploads by `cudaMemcpyAsync`.
+
+A smaller upload kernel does not help. With fewer blocks, the upload is slower and the wait is longer: 58.5 T/s with 128 blocks, 45.3 T/s with 16 blocks and 19.2 T/s with 4 blocks.
+
+#### When the patch can help
+
+These are estimates. They are not tested.
+
+- **A slow CPU for the expert calculation.** On this system, one expert on the CPU costs approximately 57 µs. An upload must also move one other expert back to RAM. Thus, an upload must prevent approximately two CPU calculations to be useful. If one expert on the CPU costs much more, for example with fewer cores or without AVX2, the balance changes.
+- **More memory bandwidth.** The uploads and the CPU worker use the same RAM. This system has DDR4.
+- **A different upload path.** An upload by `cudaMemcpyAsync` does not make the hand-off kernels wait as much. It needs a host thread that reads the plan of the select kernel and starts the copies. This is not built. An estimate from the measured costs gives 70 to 77 T/s on this system, against 75 T/s without the patch.
+
+#### How the patch works
+
+- `exllamav3/exllamav3_ext/cpu/moe_lookahead.cu` has the select, upload, commit and host-update kernels. `exllamav3/modules/moe_lookahead.py` has the tables of pointers and the calls. `block_sparse_mlp_cpu.py` calls them from the submit of each split layer and from the promote step.
+- The placement map, the set of experts in transfer and the pool of free GPU slots are in device memory. Only kernels on the compute stream change them, in stream order. The one exception is the map update of a completed upload on the second stream.
+- That map update is safe at any time. Before it, no router ID points to the GPU slot. After it, the expert is still in its RAM slot until the host sees the log entry. The host then uses the RAM slot for a demotion, and it puts this demotion after all work of the compute stream.
+- A demoted expert gives its GPU slot back to the pool in the same kernel that changes its map entry. Thus, no kernel can read the slot when a new upload writes to it.
+- If the previous upload of a layer is not complete, the layer does not start a new one in that step.
+- Before a forward pass of prefill size, the host waits for all uploads.
+- For the lookahead, the arena is registered with the `MAPPED` flag, so that kernels can read it.
+
+#### Limits
+
+- The patch is tested with one model and one system only.
+- No unit test covers the patch. The verify mode makes the checks after a synchronization, so it does not test the order of operations.
+- The output quality is not graded. More experts move between the CPU and the GPU during a generation than without the patch.
+- The patch does not use a trained correction of the prediction. On a recorded session, a correction increased the part of the CPU experts that the prediction finds from 59% to 69%.
 
 ### Control vectors
 
