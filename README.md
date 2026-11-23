@@ -50,6 +50,68 @@ The settings for this system are in the TabbyAPI configuration and start script.
 | Prefill pipeline | Adds engram lookahead, resident-first expert order, stream-ahead and an optional last-page merge. Each item has an `EXL3_*` switch. |
 | Control vectors | Applies llama.cpp control vectors to the residual stream. Refer to [Control vectors](#control-vectors). |
 | Pipelined prefill with CPU experts | Lets the two GPUs work on different prefill chunks when the CPU expert split is on. This is a port of [a commit by Auryn Macmillan](https://github.com/auryn-macmillan/exllamav3/commit/b38de78bd0376fcdc4f92344ed405800ac8374b6). The port also adds a lock to the n-gram row table. Prefill of prompts longer than one chunk is approximately 10% faster. `EXL3_PIPELINED_PREFILL=0` turns it off. |
+| Late promote hook | Moves the promote-on-miss step off the critical path of decode and makes its budget a setting. Decode is approximately 17% faster on this system. Refer to [Late promote hook](#late-promote-hook). |
+
+### Late promote hook
+
+#### Overview
+
+With the CPU expert split, some experts of each split layer are in VRAM and the others are in RAM. Promote-on-miss moves an expert from RAM to VRAM after the CPU worker calculated it, if the model uses it frequently. A less frequently used expert moves from VRAM to RAM.
+
+Stock ExLlamaV3 has two limits here:
+
+- **The budget is 6 promotions for each decode step, for all layers together.** On this system the budget is always fully used, and only 62% of the routed experts of the split layers are in VRAM.
+- **The promote step runs at the start of the decode step, in the first split layer.** At that time the GPU has no work in its queue. Thus, the GPU waits while the host does the promote step. The host needs approximately 0.17 ms for each promotion with its demotion. A larger budget makes the GPU wait longer. A budget of 33 has a higher hit rate than a budget of 6, but decode is not faster.
+
+The patch adds a mode that runs the promote step in the last split layer. At that time the host has put all earlier split layers in the queue, and the GPU is still working on them. Thus, the GPU does not wait for the promote step. A larger budget then gives faster decode.
+
+The patch is off by default. Without the variables below, the behavior is the same as stock ExLlamaV3.
+
+#### Settings
+
+| Variable | Value | Default |
+|---|---|---|
+| `EXL3_MOE_CPU_PROMOTE_LATE` | `1` runs the promote step in the last split layer. `0` runs it in the first split layer. | `0` |
+| `EXL3_MOE_CPU_PROMOTE_BUDGET` | The maximum number of promotions for each decode step, for all layers together. Each layer gets a maximum of one promotion for each step. | `6` |
+| `EXL3_MOE_CPU_PROMOTE_RATIO` | A missed expert is promoted when its hit count is this many times the hit count of the least used expert of the layer in VRAM. | `1.5` |
+
+On this system the start script sets `EXL3_MOE_CPU_PROMOTE_LATE=1` and `EXL3_MOE_CPU_PROMOTE_BUDGET=33`. 33 is the number of split layers.
+
+To see the hit rate and the host time of the promote step, set `EXL3_MOE_CPU_SWAP_DEBUG=1`. The log then shows one line for each 128 decode steps.
+
+#### How the patch works
+
+The patch changes `exllamav3/modules/block_sparse_mlp_cpu.py`.
+
+- `_split_swap_tick` counts the decode steps in the first split layer, as before. In late mode, it calls `_split_promote_step` from the last split layer of the text model that has spare slots.
+- The order of operations stays correct. A transfer goes on the promotion stream after all work that the compute stream has in its queue. This work includes the issue, the expert kernels and the collect of each earlier layer of the same step. The map update of a completed transfer goes on the compute stream before the selection translate of the last layer, and before the translate of all layers in the next step.
+- In late mode, the map updates go through pinned staging buffers. A copy from pageable host memory waits until the compute stream is empty. In the first test, this wait was approximately 15 ms for each step.
+
+#### Test results
+
+The test uses the hardware in [Hardware and constraints](#hardware-and-constraints), with TabbyAPI. Each run uses a new server and a saved expert placement. A run has 8 chat requests of 400 tokens on different topics, with greedy decode, thinking off, MTP and hybrid drafting. The decode speed is the mean of the 8 requests. The hit rate is the mean for the full run, and it includes the cold start.
+
+| Condition | Decode, each run (T/s) | Mean | Hit rate | Host time of the promote step |
+|---|---|---|---|---|
+| Stock: first layer, budget 6 | 64.9 / 64.1 / 63.7 / 63.2 / 63.3 | 63.8 | 62% | 2.1 ms |
+| First layer, budget 16 | 62.5 / 63.1 | 62.8 | 70% | 4.0 ms |
+| First layer, budget 33 | 62.6 / 61.6 | 62.1 | 75% | 5.4 ms |
+| Late, budget 6 | 68.9 / 67.6 | 68.2 | 63% | 2.6 ms |
+| Late, budget 16 | 72.9 / 73.2 | 73.0 | 70% | 5.3 ms |
+| Late, budget 33 | 75.6 / 73.8 / 74.6 | 74.7 | 75% | 7.1 ms |
+| Late, budget 33, ratio 1.2 | 75.5 / 75.4 | 75.5 | 76% | 7.5 ms |
+
+- Late mode with a budget of 33 is approximately 17% faster than stock.
+- A ratio of 1.2 gives no clear difference. The difference is smaller than the difference between two runs of one condition.
+- A test run with `EXL3_MOE_CPU_PROMOTE_VERIFY=1` compared 37,025 promotions and 37,011 demotions with the checkpoint. All were correct.
+
+#### Limits
+
+- The verify mode makes each transfer synchronous. Thus, it shows that the transferred data is correct, but it does not test the order of operations in late mode. No test covers that order.
+- The output quality is not graded. With a larger budget, more experts move between the CPU and the GPU during a generation. The same weights give slightly different results on the two devices.
+- `tests/moe_cpu/test_promote_step.py` was not run with this patch.
+- The patch is tested with one model, one workload and all split layers on one GPU.
+- The host time of the promote step increases with the budget. If the host time becomes longer than the time the GPU needs for the earlier layers, the GPU waits again.
 
 ### Control vectors
 

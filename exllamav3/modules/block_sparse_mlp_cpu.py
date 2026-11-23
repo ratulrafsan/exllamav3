@@ -177,9 +177,21 @@ def register_split_module(infer_params, module):
 
 _STATS_SAVE_INTERVAL = 4096   # decode steps between writes of the expert frequency profile
 _STATS_MIN_STEPS = 64         # decode steps a session needs before its profile is worth keeping
-_PROMOTE_BUDGET = 6         # promotions issued per step over all layers (and as many demotions)
-_PROMOTE_RATIO = 1.5        # a miss is promoted when its decayed count is this many times the victim's
+# promotions issued per step over all layers (and as many demotions), at most one per layer
+_PROMOTE_BUDGET = int(os.environ.get("EXL3_MOE_CPU_PROMOTE_BUDGET", 6))
+_PROMOTE_RATIO = float(os.environ.get("EXL3_MOE_CPU_PROMOTE_RATIO", 1.5))        # a miss is promoted when its decayed count is this many times the victim's
 _PROMOTE_DECAY = 0.98       # per-step decay of the hit counts
+# Local patch (EXL3_MOE_CPU_PROMOTE_LATE=1): run the per-step promote hook from the LAST split
+# layer's submit instead of the first. At the first layer the GPU has nothing queued, so the
+# hook's host time (about 0.17 ms per promotion + demotion pair) idles it; at the last split layer
+# the host has enqueued every earlier split layer and the GPU is still working through them. The
+# ordering argument of _split_promote_step holds unchanged: a transfer goes on the promotion
+# stream behind everything the compute stream has enqueued (each earlier layer's issue, expert
+# kernels and collect of this step), and a landed transfer's map flip is enqueued ahead of the
+# last layer's own translate and of every layer's translate of the next step. The hook must not
+# synchronize the compute stream there, so the map flips go through pinned staging buffers.
+_PROMOTE_LATE = os.environ.get("EXL3_MOE_CPU_PROMOTE_LATE", "0") != "0"
+_FLIP_RING, _FLIP_MAX = 512, 64
 
 
 class _PromoteState:
@@ -212,6 +224,11 @@ class _PromoteState:
         self.devices = sorted({torch.device(m.device).index or 0 for m in self.modules})
         self.snap_ev = {}
         self.stats = dict(routed = 0, missed = 0, steps = 0, ms = 0.0)
+        # Late hook: pinned staging for the map flips, a ring long enough that a buffer is reused
+        # only many steps after its copy ran (every step ends in a full synchronize)
+        self.flip = torch.zeros((_FLIP_RING, 2, _FLIP_MAX), dtype = torch.long).pin_memory() if _PROMOTE_LATE else None
+        self.flip_np = self.flip.numpy() if _PROMOTE_LATE else None
+        self.flip_i = 0
         # Per device, the modules' hit counts become row views of one [rows, experts] tensor (the
         # issue kernels keep writing them in place), so the snapshot and the decay are one call each
         self.hists = {}
@@ -278,7 +295,16 @@ def _split_promote_step(ip, modules, rows):
             ps.mp[i, idx] = val
             dev = torch.device(m.device)
             with torch.cuda.device(dev):
-                m._split_map[torch.tensor(idx, device = dev)] = torch.tensor(val, device = dev)
+                if ps.flip is not None and len(idx) <= _FLIP_MAX:
+                    # A pageable host-to-device copy would wait for the whole compute stream
+                    k, n = ps.flip_i % _FLIP_RING, len(idx)
+                    ps.flip_i += 1
+                    ps.flip_np[k, 0, :n] = idx
+                    ps.flip_np[k, 1, :n] = val
+                    m._split_map[ps.flip[k, 0, :n].to(dev, non_blocking = True)] = \
+                        ps.flip[k, 1, :n].to(dev, non_blocking = True)
+                else:
+                    m._split_map[torch.tensor(idx, device = dev)] = torch.tensor(val, device = dev)
     # (2) last step's routes: the snapshots land, the next ones go out
     have = bool(ps.snap_ev)
     for ev in ps.snap_ev.values():
@@ -1107,6 +1133,21 @@ class BlockSparseMLP_CPU:
         into the slots of its coldest GPU experts."""
         ip = self.config.infer_params
         reg = ip.moe_cpu_swap_modules
+        if _PROMOTE_LATE and reg[0]._split_spares:
+            # Local patch: the first module still counts the steps, the last text split module
+            # with spares runs the promote hook (see _PROMOTE_LATE)
+            if reg[0] is self:
+                self._swap_tick_count += 1
+                self._split_step_count += 1
+                if self._split_step_count % _STATS_SAVE_INTERVAL == 0:
+                    save_expert_stats(ip)
+            last = getattr(ip, "moe_cpu_promote_last", None)
+            if last is None or last[0] != len(reg):
+                text = [m for m in reg if m.cpu_component == "text" and m._split_spares]
+                last = ip.moe_cpu_promote_last = (len(reg), text[-1] if text else reg[0])
+            if last[1] is self:
+                _split_promote_step(ip, reg, self._split_submit_rows)
+            return
         if reg[0] is not self:
             return
         self._swap_tick_count += 1
