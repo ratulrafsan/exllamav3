@@ -222,7 +222,7 @@ def assemble(args):
     nv = len([i for i in range(cfg.layers) if src.has(f"model.llm.layers.{i}.mlp.experts.w13_weight_amax")])
     bits = (nv * args.bits + (cfg.layers - nv) * args.bits_mx) / cfg.layers
     config["quantization_config"] = {
-        "quant_method": "exl3", "version": exl3_version, "bits": round(bits, 2), "head_bits": 16,
+        "quant_method": "exl3", "version": exl3_version, "bits_per_weight": round(bits, 2), "head_bits": 16,
         "calibration": {"rows": args.rows, "cols": args.cols}, "codebook": "mcg",
         "note": "routed experts only; all other tensors as in the source checkpoint",
         "expert_bits": {"nvfp4_layers": args.bits, "mxfp8_layers": args.bits_mx},

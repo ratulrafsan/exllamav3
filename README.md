@@ -298,7 +298,7 @@ Conversions made with the script below are on Hugging Face, in the repository [r
 | Branch | Experts | Weight files | State |
 |---|---|---|---|
 | [`main`](https://huggingface.co/ratulrafsan/Inkling-2-Mini-EXL3/tree/main) | 6 bpw, last 4 layers 8 bpw | 21.7 GiB | The conversion all results in this section refer to, unless a table says otherwise |
-| [`4.5bpw`](https://huggingface.co/ratulrafsan/Inkling-2-Mini-EXL3/tree/4.5bpw) | 4.5 bpw: 5 bpw for layers 6 to 15 and 20 to 21, 4 bpw for the others | 16.5 GiB | Work in progress. Checked through TabbyAPI at a context of 262,144 tokens: short chats, images, a 251,619-token prompt |
+| [`4.5bpw`](https://huggingface.co/ratulrafsan/Inkling-2-Mini-EXL3/tree/4.5bpw) | 4.5 bpw: 5 bpw for layers 6 to 15 and 20 to 21, 4 bpw for the others | 16.5 GiB | Smaller and faster, a little further from the source. Checked through TabbyAPI at a context of 262,144 tokens: short chats, images, a 251,619-token prompt |
 
 ```
 hf download ratulrafsan/Inkling-2-Mini-EXL3 --local-dir Inkling-2-Mini-EXL3-6.0bpw

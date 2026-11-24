@@ -57,7 +57,9 @@ def main():
     weights = n_layers * tc["n_routed_experts"] * 3 * tc["hidden_size"] * tc["intermediate_size"]
     avg = sum(float(r) for r in rate.values()) / n_layers
     q = dict(cfg.get("quantization_config") or {})
-    q.update({"bits": round(avg, 2), "expert_bits": {str(i): float(rate[i]) for i in range(n_layers)}})
+    # The Hub's config parser wants an integer in "bits"; the average rate has its own key
+    q.pop("bits", None)
+    q.update({"bits_per_weight": round(avg, 2), "expert_bits": {str(i): float(rate[i]) for i in range(n_layers)}})
     q.pop("note", None)
     q["note"] = "routed experts only; all other tensors as in the source checkpoint; per-layer rates in expert_bits"
     cfg["quantization_config"] = q
