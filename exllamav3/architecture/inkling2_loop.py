@@ -401,7 +401,9 @@ _GRAPH_MIN_POS = 8
 # Widest step that runs as a graph (tokens of one sequence in one forward: the token to decode plus drafted tokens to
 # verify), and how many widths keep a captured graph at a time
 _GRAPH_MAX_WIDTH = int(os.environ.get("EXL3_I2_GRAPH_WIDTH", 8))
-_GRAPH_MAX_GRAPHS = 3
+_STATS = int(os.environ.get("EXL3_I2_STATS", 0))
+_GRAPH_MAX_GRAPHS = 4
+_GRAPH_WIDTHS = (1, 2, 4, 8)
 # Debug: report non-finite logits of any forward (costs a device sync per forward)
 _NAN_CHECK = os.environ.get("EXL3_I2_NAN_CHECK", "0") != "0"
 
@@ -1035,6 +1037,8 @@ class Inkling2LoopModel(Model):
         self._graph_failed = False
         self._graph_capable = None
         self.graph_steps = 0            # decode steps served by graph replay (for tests and logs)
+        self.graph_builds = 0
+        self._stats = {}
 
     @override
     def prepare_inputs(self, input_ids: torch.Tensor, params: dict) -> torch.Tensor:
@@ -1085,9 +1089,19 @@ class Inkling2LoopModel(Model):
         # The global layers read the sequence's pages as one slice of the cache when they are contiguous up to the
         # token's page, else gathered through the page table (a copy of the keys per layer application)
         pages = params["block_table"][0].tolist()
+        # A pass that verifies drafted tokens comes in any width; each width is its own graph, so the pass is
+        # padded to the next of a few widths (the last token repeated). The padded rows land past the end of
+        # the sequence, where the real tokens of those positions overwrite them later
+        real = width
+        for w in _GRAPH_WIDTHS:
+            if width <= w <= _GRAPH_MAX_WIDTH and (position + w - 1) // PAGE_SIZE < len(pages):
+                width = w
+                break
         cur = (position + width - 1) // PAGE_SIZE               # page of the last new token
         if cur >= len(pages):
             return None
+        if width != real:
+            input_ids = torch.cat([input_ids, input_ids[:, -1:].expand(-1, width - real)], dim = 1)
         base_page = pages[0]
         cap = (position + width + 1 + _GRAPH_KEY_STEP - 1) // _GRAPH_KEY_STEP * _GRAPH_KEY_STEP
         contiguous = all(pages[j] == base_page + j for j in range(cur + 1)) and \
@@ -1128,12 +1142,17 @@ class Inkling2LoopModel(Model):
                 graph = _DecodeGraph(self, cache, rs.slot, base_page, cap, width, taps)
                 graph.set_inputs(input_ids, position, cache_pos, gather)
                 graph.build()
+                self.graph_builds += 1
                 self._graphs[width] = graph
             graph.set_inputs(input_ids, position, cache_pos, gather)
             self.graph_steps += 1
             y = graph.step()
             if graph.exports:
-                params["export_states"] = [t.clone() for t in graph.exports]
+                params["export_states"] = [t[:, :real].clone() for t in graph.exports]
+            if width != real:
+                y = y[:, :real]
+                # The padded rows went through the convolution rings: they bound a later rewind
+                rs.high = max(rs.high, position + width)
             num = params.get("last_tokens_only")
             return y[:, -num:].contiguous() if num else y
         except Exception as e:
@@ -1155,6 +1174,14 @@ class Inkling2LoopModel(Model):
         x = self.prepare_inputs(input_ids, params)
         y = self._graph_step(x, params)
         graph = y is not None
+        if _STATS and params.get("cache") is not None:
+            # Which forwards of a cached sequence ran as graph replays, by (batch, tokens)
+            st = self._stats
+            k = ("graph" if graph else "op-by-op", tuple(input_ids.shape))
+            st[k] = st.get(k, 0) + 1
+            st["n"] = st.get("n", 0) + 1
+            if st["n"] % _STATS == 0:
+                print(f" -- Inkling2 forwards: { {k: v for k, v in st.items() if k != 'n'} }, graphs built {self.graph_builds}", flush = True)
         if y is None:
             y = self.forward_ls(x, params)
         if _NAN_CHECK and not torch.isfinite(y).all():

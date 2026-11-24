@@ -214,7 +214,7 @@ These are estimates. They are not tested.
 ### Inkling-2-Mini
 
 > [!WARNING]
-> This is work in progress. Text input only. The vision tower is not implemented. The draft model (the MTP head) works in the Python API; TabbyAPI does not load it yet.
+> This is work in progress. Text input only. The vision tower is not implemented. The draft model (the MTP head) works in the Python API and in TabbyAPI.
 
 #### Overview
 
@@ -241,7 +241,7 @@ The layer math and the NVFP4 / MXFP8 dequantizers are adapted from [0xSero/inkli
 | Decode as CUDA graph replays, with decode kernels | Works for one sequence with EXL3 experts. |
 | Multi-token graph steps (verify drafted tokens) | Works for a maximum of 8 tokens in one forward pass. Nothing uses them yet. |
 | Prefill | Plain PyTorch (cuBLAS). |
-| MTP head (`mtp.safetensors`, DSpark draft model) | Works in the Python API as a draft model (`architecture/inkling2_dspark.py`). Greedy, 300 tokens, low reasoning effort: 146 T/s against 72 for code, 96 against 72 for a list, 78 against 72 for prose, 32 against 69 for a 66-token answer. 17–47% of the drafts are accepted. Not quantized. Not set up in TabbyAPI. |
+| MTP head (`mtp.safetensors`, DSpark draft model) | Works as a draft model (`architecture/inkling2_dspark.py`), in the Python API and in TabbyAPI (`draft_mode: model`, `draft_num_tokens: 7`; the model directory comes from `util/inkling2/make_dspark_dir.py`). TabbyAPI, greedy, 400 tokens, default reasoning effort, context 163,840, against 65.8 T/s without it: code 107–129 T/s, list 75–85, prose 70–73, essay 56–62. With `dynamic_draft: true` (confidence 0.4) the draft block is cut where the drafter is unsure: prose, list and essay gain 5–13%, code loses 4–17%. Not quantized. |
 | Vision | Not implemented. |
 | Tensor parallelism | Not supported. |
 
@@ -347,7 +347,7 @@ The checks in `util/inkling2/` compare the port with the transformers reference 
 
 #### TODO
 
-1. **MTP draft model: make it pay off everywhere.** It always drafts 7 tokens, and a rejected draft costs a wide verification pass (30 ms against 14.5 ms). Add a confidence cut (the draft softmax probability) so the block is cut or skipped when the drafter is unsure; put the draft block and the Markov chain in a CUDA graph; move the two windowed draft layers out of the paged cache; set it up in TabbyAPI (`util/inkling2/make_dspark_dir.py` makes the model directory).
+1. **MTP draft model: raise the gain on prose.** A verification pass of 8 tokens costs about 30 ms against 14.5 ms for one token, and on prose only 1–2 drafts per pass are accepted. Ideas: a cheaper narrow pass when the drafter is unsure (the passes are padded to 1, 2, 4 or 8 tokens, so a cut only pays when it crosses one of those), the draft block and the Markov chain in a CUDA graph (now about 4 ms per round), quantized draft weights.
 2. **Prefill attention.** A kernel that uses tensor cores for the global layers. A scalar kernel was tested and was 3 to 5 times slower than cuBLAS.
 3. **Decode.** Tune the block attention residual and gate kernels, and replace the remaining small PyTorch operations. The expert kernel (approximately 4.4 ms of 14 ms for each token) and memory bandwidth set the limit after that.
 4. **Graph steps wider than 8 tokens**, for the n-gram draft verification of tabbyAPI (65 tokens).

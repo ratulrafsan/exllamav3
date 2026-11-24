@@ -22,6 +22,10 @@ def main():
     ap.add_argument("model"); ap.add_argument("draft")
     ap.add_argument("--tokens", type = int, default = 300); ap.add_argument("--cache", type = int, default = 16384)
     ap.add_argument("--draft-device", default = "cuda:1")
+    ap.add_argument("--conf", type = float, nargs = "*", default = [0, 0.4, 0.6])
+    ap.add_argument("--tabby", action = "store_true")
+    ap.add_argument("--time", action = "store_true")
+    ap.add_argument("--rounds", type = int, default = 2)
     args = ap.parse_args()
     from exllamav3 import Config, Model, Cache, Tokenizer, Generator
     from exllamav3.generator.sampler import ArgmaxSampler
@@ -29,9 +33,29 @@ def main():
     cache = Cache(model, max_num_tokens = args.cache, max_batch_size = 1, max_history = 8)
     dconfig = Config.from_directory(args.draft); draft = Model.from_config(dconfig)
     dcache = Cache(draft, max_num_tokens = args.cache)
-    model.load(reserve_per_device = [3.0, 2.5])
-    draft.load(device = args.draft_device)
+    if args.tabby:
+        # As tabbyAPI loads them: the draft model first, both by autosplit
+        draft.load(reserve_per_device = [3.0, 1.0])
+        model.load(reserve_per_device = [3.0, 1.0])
+    else:
+        model.load(reserve_per_device = [3.0, 2.5])
+        draft.load(device = args.draft_device)
     tok = Tokenizer.from_config(config)
+    times = {}
+    if args.time:
+        # Wall time of the drafter's three calls and the target forward, with a sync after each
+        def timed(obj, name):
+            fn = getattr(obj, name)
+            def w(*a, **k):
+                for d in range(torch.cuda.device_count()): torch.cuda.synchronize(d)
+                t0 = time.perf_counter(); r = fn(*a, **k)
+                for d in range(torch.cuda.device_count()): torch.cuda.synchronize(d)
+                e = times.setdefault(f"{type(obj).__name__}.{name}", [0.0, 0]); e[0] += time.perf_counter() - t0; e[1] += 1
+                return r
+            setattr(obj, name, w)
+        for n in ("forward", "sample_from_state", "update_kv_from_target"): timed(draft, n)
+        timed(model, "forward")
+        print("devices: draft modules " + str([str(m.device) for m in draft.modules]) + ", target head " + str(model.head.device), flush = True)
     print("loaded: " + ", ".join(f"cuda:{d} {torch.cuda.memory_allocated(d) / 2**30:.1f} GiB" for d in range(torch.cuda.device_count())), flush = True)
     gens = {
         "plain": Generator(model = model, cache = cache, tokenizer = tok),
@@ -42,23 +66,29 @@ def main():
                                 stop_conditions = [config.eos_token_id], add_bos = False, encode_special_tokens = True,
                                 decode_special_tokens = True, completion_only = True, return_last_results = True)
         return out, res
+    PROMPTS.append(("essay", "Write a 250-word essay about the history of the printing press."))
     plain = {}
     for name, p in PROMPTS:
         out, res = run(gens["plain"], p)
         plain[name] = (out, res["new_tokens"] / res["time_generate"])
     del gens["plain"]
-    gen = Generator(model = model, cache = cache, tokenizer = tok, draft_model = draft, draft_cache = dcache)
-    for name, p in PROMPTS:
-        g0 = model.graph_steps
-        out, res = run(gen, p)
-        ref, tps = plain[name]
-        same = 0
-        for a, b in zip(out, ref):
-            if a != b: break
-            same += 1
-        acc = {k: res[k] for k in res if "draft" in k.lower() or "accept" in k.lower()}
-        print(f"{name:6s}: plain {tps:5.1f} T/s, with drafter {res['new_tokens'] / res['time_generate']:5.1f} T/s; "
-              f"{res['new_tokens']} tokens in {model.graph_steps - g0} target forwards; text equal for {same}/{len(ref)} chars; {acc}", flush = True)
+    for conf in args.conf:
+      gen = Generator(model = model, cache = cache, tokenizer = tok, draft_model = draft, draft_cache = dcache,
+                      **({} if conf <= 0 else dict(dynamic_draft_tokens = True, draft_confidence = conf)))
+      print(f"draft_confidence {conf if conf > 0 else 'off (always 7 drafts)'}", flush = True)
+      for name, p in PROMPTS * args.rounds:
+          g0 = model.graph_steps
+          out, res = run(gen, p)
+          ref, tps = plain[name]
+          same = 0
+          for a, b in zip(out, ref):
+              if a != b: break
+              same += 1
+          acc = {k: res[k] for k in res if "draft" in k.lower() or "accept" in k.lower()}
+          print(f"{name:6s}: plain {tps:5.1f} T/s, with drafter {res['new_tokens'] / res['time_generate']:5.1f} T/s; "
+                f"{res['new_tokens']} tokens in {model.graph_steps - g0} target forwards; text equal for {same}/{len(ref)} chars; {acc}", flush = True)
+    for k, (t, n) in times.items():
+        print(f"  {k}: {n} calls, {1000 * t / n:.1f} ms each")
 
 if __name__ == "__main__":
     main()

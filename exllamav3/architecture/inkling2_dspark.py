@@ -133,7 +133,8 @@ class Inkling2DSparkParts(Module):
                 hd = head[s : s + 8192].float()
                 w[s : s + 8192] = (hd @ ow).half()
                 b[s : s + 8192] = hd @ ob
-            self.fold = (head, w, b)
+            # The chain runs on the head's device; its tables go there once (not on every round)
+            self.fold = (head, w, b, self.rnn_w.to(head.device), self.rnn_b.to(head.device), self.w1.to(head.device))
         return self.fold
 
 
@@ -250,7 +251,7 @@ class Inkling2DSparkModel(Model):
         drafts from the Markov chain over the target's head.
         """
         parts, cfg = self.parts, self.config
-        head, fold_w, fold_b = parts.head_fold()
+        head, fold_w, fold_b, rnn_w, rnn_b, w1 = parts.head_fold()
         hdev = head.device
         bsz = state.shape[0]
         K = cfg.block_size - 1
@@ -259,16 +260,16 @@ class Inkling2DSparkModel(Model):
         base = torch.matmul(hid, head.t()).float()                                    # [bsz, K, V]
         first_pages = params["block_table"][:, 0].tolist()
         f = torch.stack([parts.f_rnn[int(p)] for p in first_pages]).to(hdev)          # [bsz, D]
-        rnn_w, rnn_b = parts.rnn_w.to(hdev), parts.rnn_b.to(hdev)
         # The part of the recurrence input that does not depend on the chain: the row's hidden state and f
         ctx = torch.cat([hid.float(), f.unsqueeze(1).expand(-1, K, -1)], dim = -1) @ rnn_w[:, 2 * R:].t() + rnn_b
         w_r = rnn_w[:, : 2 * R].t()
-        w1 = parts.w1.to(hdev)
         cap = cfg.final_logit_softcapping
         V = cfg.unpadded_vocab_size
         st = torch.zeros((bsz, R), dtype = torch.float, device = hdev)
         prev = parts.anchor.to(hdev).view(bsz)
         out = [prev]
+        export = bool(params.get("export_draft_conf"))
+        conf = [torch.zeros((bsz,), dtype = torch.float, device = hdev)]
         for i in range(K):
             raw = ctx[:, i] + torch.cat([st, w1[prev].float()], dim = -1) @ w_r
             gate, cand, o = raw.chunk(3, dim = -1)
@@ -276,8 +277,17 @@ class Inkling2DSparkModel(Model):
             st = gate * st + (1.0 - gate) * torch.tanh(cand)
             z = base[:, i] + torch.tanh(o).half().matmul(fold_w.t()).float() + fold_b
             z = torch.tanh(z / cap) * cap
-            prev = z[:, :V].argmax(dim = -1)
+            if export:
+                # Confidence score for the generator's calibrated draft length: the margin between the two
+                # best logits (the logits are soft-capped, so the winning logit alone says little)
+                top = z[:, :V].topk(2, dim = -1)
+                prev = top.indices[:, 0]
+                conf.append(top.values[:, 0] - top.values[:, 1])
+            else:
+                prev = z[:, :V].argmax(dim = -1)
             out.append(prev)
+        if export:
+            params["draft_conf"] = torch.stack(conf, dim = 1)
         return torch.stack(out, dim = 1)
 
     def default_load_shape_dtype(self, chunk_size):
