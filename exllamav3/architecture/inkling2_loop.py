@@ -394,6 +394,7 @@ _ADT = {"fp16": torch.half, "bf16": torch.bfloat16, "fp32": torch.float}[os.envi
 # Decode steps (one sequence, one token, cached) replayed as CUDA graphs, one per run of layer applications on the
 # same GPU. 0 runs every step op by op
 _GRAPH = os.environ.get("EXL3_I2_GRAPH", "1") != "0"
+_EMBED_GPU = os.environ.get("EXL3_I2_EMBED", "cpu") == "gpu"
 # Capacity of the global layers' key buffer inside a graph grows in steps of this many tokens (a new step = a new
 # capture); keys past the current position are masked
 _GRAPH_KEY_STEP = 4096
@@ -711,7 +712,9 @@ class _DecodeGraph:
             self.segments[-1]["apps"].append((m, inst))
         devices = {seg["device"] for seg in self.segments}
         self.ctl = {d: torch.zeros(2, dtype = torch.long, device = d) for d in devices}
-        self.ids = torch.zeros((1, width), dtype = torch.long, device = self.segments[0]["device"])
+        # The step's input: the embedding rows of its tokens (the table may be in system RAM)
+        self.embed = model.embed
+        self.x0 = torch.zeros((1, width, cfg.hidden), dtype = self.embed.weight.dtype, device = self.embed.device)
         ar = lambda n, d: torch.arange(n, dtype = torch.long, device = d)
         kops = _KernelOps() if _KernelOps.available(model.config) else None
         self.kernels = kops is not None
@@ -739,7 +742,7 @@ class _DecodeGraph:
         params = {"cache": self.cache, "i2": [row], "i2_graph": self.g}
         if self.taps:
             params["export_state_layers"] = self.taps
-        x = self.ids
+        x = self.x0
         for seg in self.segments:
             dev = seg["device"]
             # State that arrives from another GPU: a buffer on this one, filled before every replay
@@ -796,7 +799,8 @@ class _DecodeGraph:
         self.logits = self._run(True)
 
     def set_inputs(self, input_ids: torch.Tensor, position: int, cache_pos: int, pages: list | None):
-        self.ids.copy_(input_ids)
+        w = self.embed.weight
+        self.x0.copy_(w[input_ids.to(w.device)])
         host = torch.tensor([position, cache_pos], dtype = torch.long)
         for t in self.ctl.values():
             t.copy_(host)
@@ -825,8 +829,22 @@ class Inkling2Embed(_I2Module):
     def load(self, device, **kwargs):
         self.device = device
         get = self._getter(device)
-        self.weight = get(self.key + ".weight")
+        # The table is read one row per token, so it stays in system RAM (0.9 GiB) and its VRAM goes to the layers:
+        # with a long cache that is what lets the last loop layer sit on the first GPU with the others (a loop
+        # layer on another GPU costs two crossings per pass). EXL3_I2_EMBED=gpu keeps it on the module's device
+        wdev = device if _EMBED_GPU else torch.device("cpu")
+        self.weight = self._getter(wdev)(self.key + ".weight")
         self.norm = get("model.llm.embed_norm.weight")
+        self.norm_f32 = self.norm.float().contiguous()
+
+    def rows(self, ids: torch.Tensor) -> torch.Tensor:
+        """The tokens' embedding rows as stored, on the module's device"""
+        w = self.weight
+        return w[ids.to(w.device)].to(self.device)
+
+    def lookup(self, ids: torch.Tensor, adt: torch.dtype) -> torch.Tensor:
+        """The normed embeddings of the tokens, on the module's device"""
+        return I2.rms_norm(self.rows(ids), self.norm, self.config.i2.eps).to(adt)
 
     @override
     def weights_numel(self):
@@ -835,7 +853,11 @@ class Inkling2Embed(_I2Module):
     @override
     def forward(self, x: torch.Tensor, params: dict, out_dtype: torch.dtype | None = None) -> torch.Tensor:
         if "i2_graph" in params:
-            return I2.embed_tokens(self.weight, self.norm, x, self.config.i2.eps, self.config.activation_dtype)
+            # x: the tokens' embedding rows, looked up before the replay (_DecodeGraph.set_inputs)
+            kops = params["i2_graph"]["consts"][self.device]["kops"]
+            if kops is not None and kops.fused and x.dtype == torch.half:
+                return kops.norm(x, self.norm_f32, self.config.activation_dtype, self.config.i2.eps)
+            return I2.rms_norm(x, self.norm, self.config.i2.eps).to(self.config.activation_dtype)
         params["i2"] = [_RowState() for _ in range(x.shape[0])]
         params.pop("i2_pages", None)
         if params.get("cache") is not None:
@@ -844,7 +866,7 @@ class Inkling2Embed(_I2Module):
             for rs, p in zip(params["recurrent_states"], past):
                 assert rs.position == p, f"Inkling2: recurrent state at {rs.position}, cache at {p}"
             params["i2_past"] = past
-        return I2.embed_tokens(self.weight, self.norm, x, self.config.i2.eps, self.config.activation_dtype)
+        return self.lookup(x, self.config.activation_dtype)
 
 
 class Inkling2Layer(_I2Module):

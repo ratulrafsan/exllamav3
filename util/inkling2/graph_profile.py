@@ -4,6 +4,7 @@ op by op with the same code path (the graph's capture function) under the PyTorc
 durations are summed by kernel name and device. Also the replay time of each GPU segment alone.
 
     python util/inkling2/graph_profile.py <EXL3 model dir> [--context 2000] [--width 1]
+        [--cache 163840 --chunk 4096 --reserve 3.0 1.0]
 """
 import argparse, os, time
 from collections import defaultdict
@@ -17,13 +18,20 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("model"); ap.add_argument("--context", type = int, default = 2000)
     ap.add_argument("--width", type = int, default = 1); ap.add_argument("--top", type = int, default = 28)
+    ap.add_argument("--cache", type = int, help = "cache size in tokens (default: just above the context); with "
+                    "tabbyAPI's size the GPU split is tabbyAPI's")
+    ap.add_argument("--reserve", type = float, nargs = 2, default = [3.0, 1.0], help = "GiB kept free per GPU")
+    ap.add_argument("--chunk", type = int, default = 2048, help = "max_chunk_size of the load (tabbyAPI: chunk_size)")
     args = ap.parse_args()
     from exllamav3 import Config, Model, Cache, Tokenizer
     config = Config.from_directory(args.model)
     model = Model.from_config(config)
     size = (args.context + 1400) // 256 * 256
-    cache = Cache(model, max_num_tokens = size, max_batch_size = 1)
-    model.load(reserve_per_device = [3.0, 1.0])
+    cache = Cache(model, max_num_tokens = max(size, args.cache or 0), max_batch_size = 1)
+    model.load(reserve_per_device = args.reserve, max_chunk_size = args.chunk)
+    devs = [str(m.device) for m in model.modules]
+    print("modules per device: " + ", ".join(f"{d} {devs.count(d)}" for d in sorted(set(devs))) + "; allocated GiB: " +
+          ", ".join(f"{torch.cuda.memory_allocated(d) / 2**30:.2f}" for d in range(torch.cuda.device_count())))
     tok = Tokenizer.from_config(config)
     with open(os.path.join(HERE, "..", "..", "eval", "eval_texts", "variable_man_mod.txt"), encoding = "utf8") as f:
         ids = tok.encode(f.read())

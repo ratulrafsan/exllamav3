@@ -109,9 +109,7 @@ class Inkling2DSparkParts(Module):
         # x: the anchor token ids [bsz, 1]. Block input: the anchor through the target's normed embedding, then
         # block_size - 1 mask rows
         target = self.attached_model()
-        embed = target.embed
-        ids = x.to(embed.device)
-        a = I2.embed_tokens(embed.weight, embed.norm, ids, target.config.i2.eps, torch.float)
+        a = target.embed.lookup(x, torch.float)
         a = to_device(a, self.device)
         self.anchor = x.to(self.device)
         masks = self.mask_embed.view(1, 1, -1).expand(x.shape[0], self.config.block_size - 1, -1)

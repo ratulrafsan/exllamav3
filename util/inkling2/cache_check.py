@@ -46,7 +46,8 @@ def main():
     if args.device:
         model.load(device = args.device, progressbar = True)
     else:
-        model.load(progressbar = True)
+        # Room for the logits of the whole sequence (the reference forward) next to the weights
+        model.load(progressbar = True, reserve_per_device = [6.0, 1.0])
     print(f"loaded in {time.time() - t0:.0f} s; " + ", ".join(
         f"cuda:{d} {torch.cuda.memory_allocated(d) / 2**30:.1f} GiB" for d in range(torch.cuda.device_count())))
     rl = cache.get_all_recurrent_layers()
