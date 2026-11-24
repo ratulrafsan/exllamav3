@@ -393,7 +393,10 @@ __global__ void i2_message_gate_g_kernel
     if (t == 0) g[blockIdx.x] = red[2][0];
 }
 
-// wf, wg: [r, D], so that the threads of a warp read neighbouring weights; four partial sums per dot product
+// wf, wg: [r, D]. One block per 32 channels: warp p takes the ranks p, p + 8, ... of those channels (its lanes read
+// neighbouring weights), and the first warp adds the eight partial sums. Many small blocks instead of a few threads
+// with long chains: the launch is over as soon as the longest chain is
+#define I2G_PARTS (I2_THREADS / 32)
 __launch_bounds__(I2_THREADS)
 __global__ void i2_message_gate_apply_kernel
 (
@@ -408,25 +411,29 @@ __global__ void i2_message_gate_apply_kernel
 )
 {
     __shared__ float gs[I2_MAX_RANK];
+    __shared__ float pf[I2G_PARTS][32], pg[I2G_PARTS][32];
     x += (size_t) blockIdx.y * D;
     m += (size_t) blockIdx.y * D;
     out += (size_t) blockIdx.y * D;
     g += (size_t) blockIdx.y * r;
     if (threadIdx.x < r) gs[threadIdx.x] = g[threadIdx.x];
     __syncthreads();
-    const int d = blockIdx.x * I2_THREADS + threadIdx.x;
-    if (d >= D) return;
-    float f[4] = {0.0f, 0.0f, 0.0f, 0.0f}, gn[4] = {0.0f, 0.0f, 0.0f, 0.0f};
-    int j = 0;
-    for (; j + 4 <= r; j += 4)
-        for (int u = 0; u < 4; ++u)
+    const int lane = threadIdx.x & 31, part = threadIdx.x >> 5;
+    const int d = blockIdx.x * 32 + lane;
+    float f = 0.0f, gn = 0.0f;
+    if (d < D)
+        for (int j = part; j < r; j += I2G_PARTS)
         {
-            const float gv = gs[j + u];
-            f[u] += wf[(size_t) (j + u) * D + d] * gv;
-            gn[u] += wg[(size_t) (j + u) * D + d] * gv;
+            const float gv = gs[j];
+            f += wf[(size_t) j * D + d] * gv;
+            gn += wg[(size_t) j * D + d] * gv;
         }
-    for (; j < r; ++j) { f[0] += wf[(size_t) j * D + d] * gs[j]; gn[0] += wg[(size_t) j * D + d] * gs[j]; }
-    const float fs = (f[0] + f[1]) + (f[2] + f[3]), gsum = (gn[0] + gn[1]) + (gn[2] + gn[3]);
+    pf[part][lane] = f;
+    pg[part][lane] = gn;
+    __syncthreads();
+    if (part != 0 || d >= D) return;
+    float fs = 0.0f, gsum = 0.0f;
+    for (int p = 0; p < I2G_PARTS; ++p) { fs += pf[p][lane]; gsum += pg[p][lane]; }
     out[d] = (1.0f - tanhf(fs)) * x[d] + tanhf(gsum) * m[d];
 }
 
@@ -458,7 +465,7 @@ void i2_message_gate
     i2_message_gate_g_kernel<<<dim3(r, S), I2_THREADS, 0, stream>>>(
         (const float*) x.data_ptr(), (const float*) m.data_ptr(), (const half*) wd.data_ptr(),
         (float*) g.data_ptr(), D, eps);
-    i2_message_gate_apply_kernel<<<dim3(CEIL_DIVIDE(D, I2_THREADS), S), I2_THREADS, 0, stream>>>(
+    i2_message_gate_apply_kernel<<<dim3(CEIL_DIVIDE(D, 32), S), I2_THREADS, 0, stream>>>(
         (const float*) x.data_ptr(), (const float*) m.data_ptr(), (const float*) g.data_ptr(),
         (const float*) wf.data_ptr(), (const float*) wg.data_ptr(), (float*) out.data_ptr(), D, r);
     cuda_check(cudaPeekAtLastError());
