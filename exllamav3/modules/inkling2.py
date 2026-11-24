@@ -235,6 +235,13 @@ def attn_res(blocks: torch.Tensor | None, hidden: torch.Tensor, query: torch.Ten
         out = torch.matmul(p, st).unsqueeze(1)                                        # [nq, 1, D]
         return out[0] if single else out
     out = torch.empty((q.shape[0], S, D), dtype = torch.float32, device = hidden.device)
+    ext = None if REF_EXACT else _prefill_ext()
+    if ext is not None and hidden.dtype in (torch.half, torch.float) and hidden.is_contiguous() and \
+            (not has_blocks or (blocks.dtype == torch.float and blocks.is_contiguous() and blocks.shape[0] <= 16)):
+        # Many tokens (prefill): the decode kernel, one block per (query, token); several times faster than the
+        # einsum form below, same fp32 arithmetic
+        ext.i2_attn_res(blocks if has_blocks else None, hidden, q.contiguous(), out, eps)
+        return out[0] if single else out
     for s0 in range(0, S, chunk):
         s1 = min(S, s0 + chunk)
         st = rms_norm(hidden[s0:s1], None, eps).unsqueeze(0)
