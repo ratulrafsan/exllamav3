@@ -1,5 +1,6 @@
 from __future__ import annotations
 from typing_extensions import override
+import json
 import os
 import weakref
 import torch
@@ -14,6 +15,7 @@ from ..cache.recurrent_util import prepare_for_recurrence, advance_recurrent_sta
 from ..cache.recurrent import host_copy
 from ..cache.fp16 import CacheLayer_fp16
 from ..constants import PAGE_SIZE
+from ..tokenizer.mm_embedding import FIRST_MM_EMBEDDING_INDEX
 
 """
 Local patch: Inkling-2-Mini (thinkingmachines/Inkling-2-Mini), the looped Inkling-2 text model, loaded from the
@@ -439,6 +441,36 @@ class Inkling2LoopConfig(Config):
         # Position of (layer, pass) in the forward order: the "visit" numbers a drafter's taps count
         self.app_index = {lp: n for n, lp in enumerate(c.applications)}
 
+        # The vision tower, when the model directory has its tensors: the "vision" component
+        # (architecture/inkling2_vision.py)
+        self.i2_vision = None
+        if self.stc.has_tensor("model.visual.proj_out.weight"):
+            with open(os.path.join(directory, "config.json"), encoding = "utf8") as f:
+                vc = json.load(f).get("vision_config") or {}
+            pp = {}
+            pp_path = os.path.join(directory, "processor_config.json")
+            if os.path.exists(pp_path):
+                with open(pp_path, encoding = "utf8") as f:
+                    pp = json.load(f)
+            ip = pp.get("image_processor") or {}
+            first = lambda v, d: (v[0] if isinstance(v, list) else v) if v is not None else d
+            self.i2_vision = {
+                "hidden_size": vc.get("hidden_size", 1024),
+                "num_hidden_layers": vc.get("num_hidden_layers", 23),
+                "num_attention_heads": vc.get("num_attention_heads", 16),
+                "patch": vc.get("native_patch_size", 20),
+                "merge": vc.get("adapter_merge_size", 2),
+                "posemb_grid_size": vc.get("posemb_grid_size", 32),
+                "layer_norm_eps": vc.get("layer_norm_eps", 1e-5),
+                "rope_theta": (vc.get("rope_parameters") or {}).get("rope_theta", 10000.0),
+                "image_mean": first(ip.get("image_mean"), 0.5),
+                "image_std": first(ip.get("image_std"), 0.5),
+                "rescale_factor": ip.get("rescale_factor", 1.0 / 255.0),
+                "image_token": pp.get("image_token", "<|unused_200054|>"),
+            }
+            from .inkling2_vision import Inkling2VisionModel
+            self.model_classes["vision"] = Inkling2VisionModel
+
     @override
     def default_max_position_embeddings(self):
         return 1048576
@@ -842,9 +874,26 @@ class Inkling2Embed(_I2Module):
         w = self.weight
         return w[ids.to(w.device)].to(self.device)
 
-    def lookup(self, ids: torch.Tensor, adt: torch.dtype) -> torch.Tensor:
-        """The normed embeddings of the tokens, on the module's device"""
-        return I2.rms_norm(self.rows(ids), self.norm, self.config.i2.eps).to(adt)
+    def lookup(self, ids: torch.Tensor, adt: torch.dtype, params: dict | None = None) -> torch.Tensor:
+        """
+        The normed embeddings of the tokens, on the module's device. Ids of multimodal embeddings
+        (params["indexed_embeddings"], e.g. image tokens) take their rows from the embedding as they are: the
+        vision tower's output replaces the normed text embeddings, as in the reference
+        """
+        emb = (params or {}).get("indexed_embeddings")
+        if not emb or int(ids.max()) < FIRST_MM_EMBEDDING_INDEX:
+            return I2.rms_norm(self.rows(ids), self.norm, self.config.i2.eps).to(adt)
+        ids = ids.to(self.device)
+        mm = ids >= FIRST_MM_EMBEDDING_INDEX
+        x = I2.rms_norm(self.rows(ids.masked_fill(mm, 0)), self.norm, self.config.i2.eps).to(adt)
+        todo = mm.clone()
+        for e in emb:
+            m = (ids >= e.first_index) & (ids < e.first_index + e.mm_length)
+            if m.any():
+                x[m] = e.embeddings.to(self.device, adt)[ids[m] - e.first_index]
+                todo &= ~m
+        assert not todo.any(), "Inkling2: the prompt has multimodal token ids without their embeddings"
+        return x
 
     @override
     def weights_numel(self):
@@ -866,7 +915,7 @@ class Inkling2Embed(_I2Module):
             for rs, p in zip(params["recurrent_states"], past):
                 assert rs.position == p, f"Inkling2: recurrent state at {rs.position}, cache at {p}"
             params["i2_past"] = past
-        return self.lookup(x, self.config.activation_dtype)
+        return self.lookup(x, self.config.activation_dtype, params)
 
 
 class Inkling2Layer(_I2Module):
@@ -1147,7 +1196,11 @@ class Inkling2LoopModel(Model):
             return None
         cache = params.get("cache")
         rsg = params.get("recurrent_states")
-        if cache is None or not rsg or len(rsg) != 1 or params.get("indexed_embeddings") or "i2_pos0" in params:
+        if cache is None or not rsg or len(rsg) != 1 or "i2_pos0" in params:
+            return None
+        # Image tokens (multimodal embeddings) take the op-by-op forward, which splices them in; a step of text
+        # tokens of a sequence that has images runs as a graph like any other
+        if int(input_ids.max()) >= FIRST_MM_EMBEDDING_INDEX:
             return None
         # More than one token (a pass that verifies drafted tokens) needs every kernel
         if width > 1 and not (_KernelOps.available(self.config) and _KernelOps().has_qkv):
