@@ -213,8 +213,8 @@ These are estimates. They are not tested.
 
 ### Inkling-2-Mini
 
-> [!WARNING]
-> This is work in progress. Text input only. The vision tower is not implemented. The draft model (the MTP head) works in the Python API and in TabbyAPI.
+> [!NOTE]
+> Text and image input work, in the Python API and in TabbyAPI, and the MTP head works as a draft model. The port is still being worked on: refer to [Limits](#limits) and [TODO](#todo). Converted models are on Hugging Face: refer to [Published conversions](#published-conversions).
 
 #### Overview
 
