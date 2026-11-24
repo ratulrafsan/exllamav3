@@ -100,14 +100,15 @@ void i2_qkv_post
 );
 
 // Attention with the relative-position bias and the sink, keys read in place from a K/V store (half [rows, Hk,
-// dh]). Two launches: per (token, K/V head, block of 32 keys) the scores of the G query heads that share the K/V
-// head, their block maximum, sum of exponentials and weighted value sums; then per (token, query head) the merge of
-// its blocks with the sink logit. A token sees the keys at or before its own position.
+// dh]). Two launches: per (K/V head, block of 32 keys), for every token of the pass, the scores of the G query
+// heads that share the K/V head, their block maximum, sum of exponentials and weighted value sums (K and V are
+// read once for all S <= 8 tokens); then per (token, query head) the merge of its blocks with the sink logit. A
+// token sees the keys at or before its own position.
 //   q: float [S, H, dh], rel: float [S, H, dr], sinks: float [S, H], proj: float [dr, extent]
 //   local: a token's keys are the last min(position + 1, window) rows ending at its row
 //   else:  positions 0 .. position, at rows base + p, or through pages
-//   part: float scratch [S * Hk * blocks * G * (2 + dh)], blocks = the key capacity / 32 (the launch grid; blocks
-//         past a token's keys return at once)
+//   part: float scratch [S * Hk * blocks * G * (2 + dh)], blocks = the key capacity / 32, or (window + S - 1) /
+//         32 rounded up when local (the launch grid; blocks past the keys of the pass return at once)
 //   out: float [S, H, dh]
 //   sinks may be half. ogate: optional half [S, H * dh]: out is then half, the fp16-rounded attention output
 //   times sigmoid(ogate)

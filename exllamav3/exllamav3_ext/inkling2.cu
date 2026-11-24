@@ -497,21 +497,34 @@ __device__ __forceinline__ void i2_load8(const half* p, float* f)
 
 #define I2A_SPAN (I2A_MAX_DH / I2A_PARTS)       // dimensions per thread: 16
 
-// A block takes 32 keys. Thread t takes key t % 32 (its lane) and one eighth of the head dimensions (its warp), for
-// the scores and again for the weighted values, and reads its 16 halves of K or V with two 16-byte loads: the kernel
-// is bound by memory traffic, and a load of one half per instruction reaches a third of the bandwidth. Sums over
-// the keys of a block are warp-shuffle reductions.
+// A block takes 32 keys, for all S tokens of the pass at once, in three stages:
+//
+//   1. Load and scores. Thread = (key, one eighth of the head dimensions): a warp holds four keys, so its loads are
+//      four contiguous rows. Each thread reads its 16 halves of K and of V once, with two 16-byte loads each (the
+//      kernel is bound by memory traffic at long context; a load of one half per instruction reaches a third of the
+//      bandwidth). V goes to shared memory. The partial dot products of a key are summed over its eight threads
+//      with three shuffles.
+//   2. Per (token, query head), one warp with a key per lane: scale, relative bias, mask, the block maximum, the
+//      exponentials and their sum.
+//   3. Weighted values. Thread = (value dimension, half of the (token, head) pairs): a plain sum over the 32 keys
+//      from shared memory.
+//
+// Keys are numbered from the first key of the first token: key j is n0 - 1 - j positions before the first token
+// (n0 = that token's key count), so token `tok` is at distance tok + n0 - 1 - j and sees the key when the distance
+// is not negative and, on a sliding layer, inside the window.
+#define I2A_MAX_S 8
 __launch_bounds__(I2A_THREADS)
 __global__ void i2_attn_part_kernel
 (
-    const float* q,
-    const float* rel,
+    const float* __restrict__ q,
+    const float* __restrict__ rel,
     const float* __restrict__ proj,
     const half* __restrict__ k_store,
     const half* __restrict__ v_store,
     const int64_t* __restrict__ pages,
     const int64_t* __restrict__ ctl,
     float* __restrict__ part,
+    const int S,
     const int G,
     const int Hk,
     const int dh,
@@ -524,107 +537,117 @@ __global__ void i2_attn_part_kernel
     const float scale
 )
 {
-    __shared__ float qs[I2A_MAX_G][I2A_MAX_DH];
-    __shared__ float pd[I2A_MAX_G][I2A_PARTS][I2A_KB];
-    __shared__ float es[I2A_MAX_G][I2A_KB];
+    __shared__ float vs[I2A_KB][I2A_MAX_DH];
+    __shared__ float sc[I2A_MAX_S * I2A_MAX_G][I2A_KB];        // scores, then exponentials
 
-    const int hk = blockIdx.x, b = blockIdx.y, tok = blockIdx.z, t = threadIdx.x;
+    const int hk = blockIdx.x, b = blockIdx.y, t = threadIdx.x;
+    const int lane = t & 31, warp = t >> 5;
     const int H = Hk * G;
-    const int64_t pos = ctl[0] + tok, cpos = ctl[1] + tok;      // this token's position and sliding-buffer row
-    const int64_t n = local ? min(pos + 1, window) : pos + 1;
-    float* po = part + (((size_t) tok * Hk + hk) * blocks + b) * G * (2 + dh);
-    q += (size_t) tok * H * dh;
-    rel += (size_t) tok * H * dr;
-    if ((int64_t) b * I2A_KB >= n)
+    const int64_t pos0 = ctl[0], cpos0 = ctl[1];                // the first token's position and sliding-buffer row
+    const int64_t n0 = local ? min(pos0 + 1, window) : pos0 + 1;
+    const int64_t jb = (int64_t) b * I2A_KB;
+    const int64_t jlast = n0 - 1 + S - 1;                       // the last key of the pass
+    const size_t pstep = (size_t) G * (2 + dh);
+    #define I2A_PO(tok) (part + (((size_t) (tok) * Hk + hk) * blocks + b) * pstep)
+    #define I2A_SEES(tok) (jb <= (tok) + n0 - 1 && !(local && (tok) + n0 - 1 - (jb + I2A_KB - 1) >= window))
+
+    // No token sees a key of this block: empty entries for the merge, and nothing is read
+    if (jb > jlast)
     {
-        if (t < G) { po[(size_t) t * (2 + dh)] = -INFINITY; po[(size_t) t * (2 + dh) + 1] = 0.0f; }
+        if (t < S * G)
+        {
+            float* po = I2A_PO(t / G) + (size_t) (t % G) * (2 + dh);
+            po[0] = -INFINITY; po[1] = 0.0f;
+        }
         return;
     }
-    for (int i = t; i < G * dh; i += I2A_THREADS) qs[i / dh][i % dh] = q[(size_t) hk * G * dh + i];
-    __syncthreads();
 
-    const int key = t & (I2A_KB - 1), pt = t / I2A_KB;
-    const int64_t j = (int64_t) b * I2A_KB + key;
-    const bool valid = j < n;
-    const int64_t d = n - 1 - j;
-    const int64_t p = pos - d;
-    const int64_t row = !valid ? 0 : (local ? cpos - d : (pages ? pages[p >> 8] * 256 + (p & 255) : base + p));
-    const size_t off = ((size_t) row * Hk + hk) * dh + pt * I2A_SPAN;
-
-    // Scores
-    float f[I2A_SPAN];
-    float s[I2A_MAX_G];
-    for (int g = 0; g < G; ++g) s[g] = 0.0f;
-    if (valid)
+    // Stage 1
     {
-        i2_load8(k_store + off, f);
-        i2_load8(k_store + off + 8, f + 8);
-        for (int g = 0; g < G; ++g)
+        const int key = warp * 4 + (lane >> 3), pt = lane & 7;
+        const int64_t j = jb + key;
+        const bool exists = j <= jlast;
+        const int64_t row = !exists ? 0 : (local ? cpos0 - (n0 - 1) + j : (pages ? pages[j >> 8] * 256 + (j & 255) : base + j));
+        const size_t off = ((size_t) row * Hk + hk) * dh + pt * I2A_SPAN;
+        float fk[I2A_SPAN], fv[I2A_SPAN];
+        if (exists)
         {
+            i2_load8(k_store + off, fk);
+            i2_load8(k_store + off + 8, fk + 8);
+            i2_load8(v_store + off, fv);
+            i2_load8(v_store + off + 8, fv + 8);
+        }
+        else
+            for (int i = 0; i < I2A_SPAN; ++i) { fk[i] = 0.0f; fv[i] = 0.0f; }
+        for (int i = 0; i < I2A_SPAN; ++i) vs[key][pt * I2A_SPAN + i] = fv[i];
+        for (int p = 0; p < S * G; ++p)
+        {
+            const float* qp = q + ((size_t) (p / G) * H + hk * G + p % G) * dh + pt * I2A_SPAN;
             float a0 = 0.0f, a1 = 0.0f;
             for (int i = 0; i < I2A_SPAN; i += 2)
             {
-                a0 += qs[g][pt * I2A_SPAN + i] * f[i];
-                a1 += qs[g][pt * I2A_SPAN + i + 1] * f[i + 1];
+                a0 += qp[i] * fk[i];
+                a1 += qp[i + 1] * fk[i + 1];
             }
-            s[g] = a0 + a1;
-        }
-    }
-    for (int g = 0; g < G; ++g) pd[g][pt][key] = s[g];
-    __syncthreads();
-
-    // Per head: the scores of the 32 keys with bias, their maximum, exponentials and sum (the first warp)
-    if (pt == 0)
-    {
-        for (int g = 0; g < G; ++g)
-        {
-            float v = -INFINITY;
-            if (valid)
-            {
-                v = 0.0f;
-                for (int e = 0; e < I2A_PARTS; ++e) v += pd[g][e][key];
-                v *= scale;
-                if (d < extent)
-                {
-                    const float* rp = rel + (size_t) (hk * G + g) * dr;
-                    float bias = 0.0f;
-                    for (int r = 0; r < dr; ++r) bias += rp[r] * proj[(size_t) r * extent + d];
-                    v += bias;
-                }
-            }
-            float m = v;
-            for (int o = 16; o > 0; o >>= 1) m = fmaxf(m, __shfl_xor_sync(0xffffffff, m, o));
-            const float e = valid ? expf(v - m) : 0.0f;
-            float den = e;
-            for (int o = 16; o > 0; o >>= 1) den += __shfl_xor_sync(0xffffffff, den, o);
-            es[g][key] = e;
-            if (key == 0)
-            {
-                po[(size_t) g * (2 + dh)] = m;
-                po[(size_t) g * (2 + dh) + 1] = den;
-            }
+            float v = a0 + a1;
+            v += __shfl_xor_sync(0xffffffff, v, 1);
+            v += __shfl_xor_sync(0xffffffff, v, 2);
+            v += __shfl_xor_sync(0xffffffff, v, 4);
+            if (pt == 0) sc[p][key] = v;
         }
     }
     __syncthreads();
 
-    // Weighted value sums over the keys: per thread 16 dimensions of its key, summed over the lanes
-    if (valid)
+    // Stage 2: lane = key
+    for (int p = warp; p < S * G; p += I2A_THREADS / 32)
     {
-        i2_load8(v_store + off, f);
-        i2_load8(v_store + off + 8, f + 8);
-    }
-    else
-        for (int i = 0; i < I2A_SPAN; ++i) f[i] = 0.0f;
-    for (int g = 0; g < G; ++g)
-    {
-        const float w = es[g][key];
-        for (int i = 0; i < I2A_SPAN; ++i)
+        const int tok = p / G, g = p % G;
+        float* po = I2A_PO(tok) + (size_t) g * (2 + dh);
+        if (!I2A_SEES(tok))
         {
-            float v = w * f[i];
-            for (int o = 16; o > 0; o >>= 1) v += __shfl_xor_sync(0xffffffff, v, o);
-            if (key == 0) po[(size_t) g * (2 + dh) + 2 + pt * I2A_SPAN + i] = v;
+            if (lane == 0) { po[0] = -INFINITY; po[1] = 0.0f; }
+            continue;
+        }
+        const int64_t j = jb + lane;
+        const int64_t d = tok + n0 - 1 - j;
+        const bool valid = j <= jlast && d >= 0 && !(local && d >= window);
+        float v = -INFINITY;
+        if (valid)
+        {
+            v = sc[p][lane] * scale;
+            if (d < extent)
+            {
+                const float* rp = rel + ((size_t) tok * H + hk * G + g) * dr;
+                float bias = 0.0f;
+                for (int r = 0; r < dr; ++r) bias += rp[r] * proj[(size_t) r * extent + d];
+                v += bias;
+            }
+        }
+        float m = v;
+        for (int o = 16; o > 0; o >>= 1) m = fmaxf(m, __shfl_xor_sync(0xffffffff, m, o));
+        const float e = valid ? expf(v - m) : 0.0f;
+        float den = e;
+        for (int o = 16; o > 0; o >>= 1) den += __shfl_xor_sync(0xffffffff, den, o);
+        sc[p][lane] = e;
+        if (lane == 0) { po[0] = m; po[1] = den; }
+    }
+    __syncthreads();
+
+    // Stage 3: thread = (value dimension, every second pair)
+    {
+        const int dim = t & (I2A_MAX_DH - 1);
+        for (int p = t / I2A_MAX_DH; p < S * G; p += I2A_THREADS / I2A_MAX_DH)
+        {
+            const int tok = p / G, g = p % G;
+            if (!I2A_SEES(tok)) continue;                       // the merge does not read these
+            float a[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+            for (int key = 0; key < I2A_KB; key += 4)
+                for (int u = 0; u < 4; ++u) a[u] += sc[p][key + u] * vs[key + u][dim];
+            I2A_PO(tok)[(size_t) g * (2 + dh) + 2 + dim] = (a[0] + a[1]) + (a[2] + a[3]);
         }
     }
+    #undef I2A_PO
+    #undef I2A_SEES
 }
 
 // Merge of a head's blocks with the sink: one block per (head, 16 value dimensions)
@@ -649,9 +672,10 @@ __global__ void i2_attn_merge_kernel
     __shared__ float stat[2];
     const int h = blockIdx.x, tok = blockIdx.z, t = threadIdx.x;
     const int hk = h / G, g = h % G;
-    const int64_t pos = ctl[0] + tok;
-    const int64_t n = local ? min(pos + 1, window) : pos + 1;
-    const int nb = (int) ((n + I2A_KB - 1) / I2A_KB);
+    // The blocks of the whole pass (see the part kernel); the ones this token does not see hold -inf and 0, and
+    // their value sums are not written
+    const int64_t n0 = local ? min(ctl[0] + 1, window) : ctl[0] + 1;
+    const int nb = (int) ((n0 + (int64_t) gridDim.z - 1 + I2A_KB - 1) / I2A_KB);
     const float* pb = part + ((((size_t) tok * Hk + hk) * blocks) * G + g) * (2 + dh);
     const size_t step = (size_t) G * (2 + dh);
     const size_t si = (size_t) tok * Hk * G + h;
@@ -689,7 +713,11 @@ __global__ void i2_attn_merge_kernel
     const int dim = blockIdx.y * I2A_MDIMS + dl;
     float v = 0.0f;
     if (dim < dh)
-        for (int b = chain; b < nb; b += chains) v += expf(pb[b * step] - mx) * pb[b * step + 2 + dim];
+        for (int b = chain; b < nb; b += chains)
+        {
+            const float e = expf(pb[b * step] - mx);
+            if (e > 0.0f) v += e * pb[b * step + 2 + dim];
+        }
     red[t] = v;
     __syncthreads();
     if (t < I2A_MDIMS && dim < dh)
@@ -753,7 +781,8 @@ void i2_attn_one
     }
     TORCH_CHECK(out.numel() == (int64_t) S * H * dh && out.scalar_type() == (gp ? at::kHalf : at::kFloat) && out.is_contiguous(), "i2_attn_one: out");
     TORCH_CHECK(ctl.scalar_type() == at::kLong && ctl.numel() >= 2, "i2_attn_one: ctl");
-    const int blocks = (int) CEIL_DIVIDE(local ? window : capacity, (int64_t) I2A_KB);
+    TORCH_CHECK(S <= I2A_MAX_S, "i2_attn_one: too many tokens in one pass");
+    const int blocks = (int) CEIL_DIVIDE(local ? window + S - 1 : capacity, (int64_t) I2A_KB);
     TORCH_CHECK(part.scalar_type() == at::kFloat && part.numel() >= (int64_t) S * Hk * blocks * G * (2 + dh), "i2_attn_one: part");
     const int64_t* pp = nullptr;
     if (pages.has_value())
@@ -761,11 +790,11 @@ void i2_attn_one
         TORCH_CHECK(pages.value().scalar_type() == at::kLong, "i2_attn_one: pages");
         pp = (const int64_t*) pages.value().data_ptr();
     }
-    dim3 grid(Hk, blocks, S);
+    dim3 grid(Hk, blocks);
     i2_attn_part_kernel<<<grid, I2A_THREADS, 0, stream>>>(
         (const float*) q.data_ptr(), (const float*) rel.data_ptr(), (const float*) proj.data_ptr(),
         (const half*) k_store.data_ptr(), (const half*) v_store.data_ptr(), pp, (const int64_t*) ctl.data_ptr(),
-        (float*) part.data_ptr(), G, Hk, dh, dr, extent, blocks, local, base, window, scale);
+        (float*) part.data_ptr(), S, G, Hk, dh, dr, extent, blocks, local, base, window, scale);
     dim3 mgrid(H, CEIL_DIVIDE(dh, I2A_MDIMS), S);
     i2_attn_merge_kernel<<<mgrid, I2A_THREADS, 0, stream>>>(
         (const float*) part.data_ptr(), sinks.data_ptr(), (const int64_t*) ctl.data_ptr(),
