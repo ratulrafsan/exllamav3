@@ -484,6 +484,10 @@ class Generator:
         if self.dynamic_draft and self.draft_model is not None:
             self.draft_calibrator = DraftConfidenceCalibrator(draft_confidence)
 
+        # Sizes of the target's verification passes, when it runs them at fixed sizes (see
+        # iterate_draftmodel_dflash_gen)
+        self.draft_pass_widths = self.model.caps.get("draft_pass_widths")
+
         # Sparse drafting head over a frequency-selected vocabulary subset (layer-split mode only)
         self.sparse_head = None
         self._sparse_flag = False
@@ -1492,6 +1496,14 @@ class Generator:
             self._draft_conf_round = {"ids": ids_full, "conf": conf, "window": w_used}
             if w_used == 0:
                 return None
+            # A target that verifies in passes of fixed sizes (caps["draft_pass_widths"], in tokens including the
+            # round's input token) pads a shorter pass up to the next size anyway: the cut draft takes those
+            # slots, at no cost, and the calibrator gets labels from below its threshold
+            widths = self.draft_pass_widths if batch_size == 1 else None
+            if widths and w_used < window:
+                total = next((w for w in widths if w >= w_used + 1), None)
+                if total is not None:
+                    w_used = min(total - 1, window)
             window = w_used
 
         self.draft_ids_pinned[:batch_size, :window].copy_(new_ids[:batch_size, :window])

@@ -1102,6 +1102,8 @@ class Inkling2LoopModel(Model):
             # under full load power-cycled the computer, three times out of three (2026-11-24), and the path is
             # not validated against the sequential one for this model
             "pipelined_prefill": os.environ.get("EXL3_I2_PIPELINED_PREFILL", "0") == "1",
+            # A pass that verifies drafted tokens runs as a CUDA graph of one of these sizes (padded up to it)
+            "draft_pass_widths": tuple(w for w in _GRAPH_WIDTHS if w <= _GRAPH_MAX_WIDTH),
         })
         self.recurrent_state_cls = Inkling2State
         self._graphs = {}               # tokens per step -> _DecodeGraph
