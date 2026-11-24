@@ -632,6 +632,13 @@ class LayerWeights:
             qm = get("model.llm.middle_cycle_cross_pass_queries")[2 * j : 2 * j + 2]
             kv = get("model.llm.middle_cycle_cross_pass_kv_queries")[2 * j : 2 * j + 2]
             self.msg_query = torch.cat([qm[:1], kv, qm[1:]], dim = 0).float().contiguous()
+        self._qkv_norms = None
+
+    def qkv_norms(self) -> torch.Tensor:
+        """The Q, K and V input norm gains of a global layer as one tensor, fp32 [3, D]"""
+        if self._qkv_norms is None:
+            self._qkv_norms = torch.stack([self.q_norm, self.k_norm, self.v_norm]).contiguous()
+        return self._qkv_norms
 
 
 class HeadWeights:
@@ -640,6 +647,13 @@ class HeadWeights:
         self.out_query = get("model.llm.attn_res.output_query")
         self.norm = get("model.llm.norm.weight")
         self.lm_head = get("model.llm.unembed.weight") if with_lm_head else None
+        self._f32 = None
+
+    def f32(self):
+        """(output query, norm gain) in fp32, as the fused decode kernels read them"""
+        if self._f32 is None:
+            self._f32 = (self.out_query.float().contiguous(), self.norm.float().contiguous())
+        return self._f32
 
 
 class PackedExperts:
@@ -681,19 +695,40 @@ class PackedExperts:
 # Layer computation
 
 def layer_attention(W: LayerWeights, hidden: torch.Tensor, blocks: torch.Tensor | None, adt = torch.bfloat16,
-                    cache = None, pos0: int = 0, msgs: torch.Tensor | None = None):
+                    cache = None, pos0: int = 0, msgs: torch.Tensor | None = None, add: torch.Tensor | None = None):
     """
     Attention half of a decoder layer for one sequence. hidden: [S, D] adt, blocks: [nb, S, D] block states or None,
     msgs: fp32 [4, S, D] (Q, K, V, MLP messages) in the passes after the first.
     Returns the post-attention-conv output [S, D] (adt).
+    add (fused decode kernels only): a residual the last convolution adds to its output.
     """
     cfg, i = W.cfg, W.i
     S = hidden.shape[0]
     H, Hk, dh, dr = cfg.heads, cfg.kv_heads, cfg.head_dim, cfg.d_rel
     # Fused kernels for one token (decode step in a CUDA graph), when the cache offers them
     kops = getattr(cache, "kops", None)
+    fused = kops is not None and kops.fused
     gate = lambda n, x: message_gate(x, msgs[n], *W.gates[n], cfg.eps, adt, kops)
-    if W.is_global:
+    if fused:
+        # The three inputs' gates write into one buffer and one kernel does the norms, gains and fp16 casts
+        if i == 0:
+            x = hidden
+        else:
+            x = attn_res(blocks, hidden, W.attn_query, cfg.eps, kops = kops)       # fp32 [3, S, D] or [S, D]
+        if msgs is not None:
+            g3 = torch.empty((3, S, hidden.shape[-1]), dtype = torch.float32, device = hidden.device)
+            for n in range(3):
+                kops.message_gate(x[n] if x.dim() == 3 else x, msgs[n], *W.gates[n], cfg.eps, out = g3[n])
+            x = g3
+        if W.is_global:
+            if x.dim() == 2:
+                x = x.unsqueeze(0).expand(3, -1, -1).contiguous()
+            xq, xk, xv = kops.norm(x, W.qkv_norms(), adt, cfg.eps).unbind(0)
+        elif x.dim() == 3:
+            xq, xk, xv = kops.norm(x, W.attn_norm, adt, cfg.eps).unbind(0)
+        else:
+            xq = xk = xv = kops.norm(x, W.attn_norm, adt, cfg.eps)
+    elif W.is_global:
         if i == 0:
             xq = xk = xv = hidden.float()
         else:
@@ -735,8 +770,9 @@ def layer_attention(W: LayerWeights, hidden: torch.Tensor, blocks: torch.Tensor 
         ck = cfg.conv_k
         if W.is_global:
             sc = 1.0 / math.sqrt(2 * ck + 1)
-            dk = dk.float().view(S, Hk, ck).flip(-1).contiguous()
-            dv = dv.float().view(S, Hk, ck).flip(-1).contiguous()
+            if not fused:
+                dk = dk.float().view(S, Hk, ck).flip(-1).contiguous()
+                dv = dv.float().view(S, Hk, ck).flip(-1).contiguous()
             k = cache.conv_step("k", k, W.kc_fwd, sc, dk)
             v = cache.conv_step("v", v, W.vc_fwd, sc, dv)
         else:
@@ -759,6 +795,11 @@ def layer_attention(W: LayerWeights, hidden: torch.Tensor, blocks: torch.Tensor 
     if kops is not None and kops.has_qkv:
         # Clips, scales, value norm and the K / V cache writes in one kernel, then the attention kernel
         qf, relf = cache.qkv_post(W, q, r, k, v)
+        if fused:
+            # The merge kernel applies the output gate and writes fp16; the last convolution adds the residual
+            o = cache.attend(qf, relf, sinks, W.rel_proj, dh ** -0.5, ogate).view(S, H * dh)
+            o = F.linear(o, W.wo)
+            return cache.conv_step("attn", o, W.attn_sconv, 1.0 / math.sqrt(cfg.conv_k + 1), add = add)
         o = cache.attend(qf, relf, sinks, W.rel_proj, dh ** -0.5).to(adt)
         o = (o.reshape(S, H * dh).float() * torch.sigmoid(ogate.float())).to(adt)
         o = F.linear(o, W.wo)
@@ -814,20 +855,22 @@ def layer_mlp_input(W: LayerWeights, hidden: torch.Tensor, blocks: torch.Tensor 
     Everything between the attention output and the experts. Returns (resid fp32 [S, D], x_mlp adt [S, D], the
     block states after this layer). At a block boundary the incoming hidden state becomes a block state and is not
     added to the residual.
+    With the fused decode kernels, attn_out is the residual already (see layer_attention's `add`).
     """
     cfg, i = W.cfg, W.i
+    fused = kops is not None and kops.fused
     a = attn_out.float()
     if cfg.is_boundary(i):
         resid = a
-        new = block_state(hidden, cfg.eps)
+        new = kops.norm(hidden, None, torch.float32, cfg.eps).unsqueeze(0) if fused else block_state(hidden, cfg.eps)
         bl = new if blocks is None or blocks.shape[0] == 0 else torch.cat([blocks, new], 0)
     else:
-        resid = hidden.float() + a
+        resid = a if fused else hidden.float() + a
         bl = blocks
     x = attn_res(bl, resid, W.mlp_query, cfg.eps, kops = kops)
     if msgs is not None:
         x = message_gate(x, msgs[3], *W.gates[3], cfg.eps, adt, kops)
-    x = rms_norm(x, W.mlp_norm, cfg.eps).to(adt)
+    x = kops.norm(x, W.mlp_norm, adt, cfg.eps) if fused else rms_norm(x, W.mlp_norm, cfg.eps).to(adt)
     return resid, x, bl
 
 
@@ -878,6 +921,12 @@ def moe_forward(x: torch.Tensor, sel: torch.Tensor, rw: torch.Tensor, ex, cfg: I
 
 def layer_finish(W: LayerWeights, resid: torch.Tensor, moe_out: torch.Tensor, adt = torch.bfloat16,
                  cache = None) -> torch.Tensor:
+    kops = getattr(cache, "kops", None)
+    if kops is not None and kops.fused:
+        # Convolution, residual and the fp16 cast in one kernel. moe_out is fp32 here: the kernel rounds it to
+        # fp16 first, as the unfused chain does
+        return cache.conv_step("mlp", moe_out, W.mlp_sconv, 1.0 / math.sqrt(W.cfg.conv_k + 1), add = resid,
+                               round_x = moe_out.dtype == torch.float32, out_dtype = adt)
     if cache is None:
         y = short_conv(moe_out, W.mlp_sconv, W.cfg.conv_k, adt)
     elif getattr(cache, "kops", None) is not None:
@@ -892,11 +941,14 @@ def layer_forward(W: LayerWeights, ex, hidden, blocks, adt = torch.bfloat16, cac
                   msgs: torch.Tensor | None = None, trace: dict | None = None):
     """One decoder layer application for one sequence. Returns (new_hidden, new_blocks)"""
     cfg, i = W.cfg, W.i
-    a = layer_attention(W, hidden, blocks, adt, cache, pos0, msgs)
-    resid, x, blocks = layer_mlp_input(W, hidden, blocks, a, adt, msgs, getattr(cache, "kops", None))
+    kops = getattr(cache, "kops", None)
+    fused = kops is not None and kops.fused
+    a = layer_attention(W, hidden, blocks, adt, cache, pos0, msgs,
+                        add = hidden if fused and not cfg.is_boundary(i) else None)
+    resid, x, blocks = layer_mlp_input(W, hidden, blocks, a, adt, msgs, kops)
     if hasattr(ex, "moe"):
         # The experts run the whole sparse MLP themselves, router included (EXL3 kernels)
-        y = ex.moe(x, adt)
+        y = ex.moe(x, None if fused else adt)
     else:
         sel, rw = route(W, x, pos0)
         if trace is not None:
@@ -949,7 +1001,11 @@ def embed_tokens(embed: torch.Tensor, embed_norm: torch.Tensor, ids: torch.Tenso
     return rms_norm(embed[ids], embed_norm, eps).to(adt)
 
 
-def final_hidden(Hd: HeadWeights, hidden, blocks, adt = torch.bfloat16):
+def final_hidden(Hd: HeadWeights, hidden, blocks, adt = torch.bfloat16, kops = None):
+    if kops is not None and kops.fused:
+        query, gain = Hd.f32()
+        x = attn_res(blocks, hidden, query, Hd.cfg.eps, kops = kops)
+        return kops.norm(x, gain, adt, Hd.cfg.eps)
     x = attn_res(blocks, hidden, Hd.out_query, Hd.cfg.eps)
     return rms_norm(x, Hd.norm, Hd.cfg.eps).to(adt)
 

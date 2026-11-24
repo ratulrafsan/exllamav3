@@ -11,6 +11,10 @@
 #define I2_MAX_STATES 16
 #define I2_MAX_TAPS 8
 #define I2_MAX_RANK 64
+#define I2C_X_ROUND 1
+#define I2C_ADD_HALF 2
+#define I2C_OUT_HALF 4
+#define I2C_DYN_HALF_REV 8
 
 // ---------------------------------------------------------------------------------------------------------------
 // Convolution step
@@ -22,24 +26,31 @@ __global__ void i2_conv_step_kernel
     const void* __restrict__ x_,
     half* __restrict__ ring,
     const float* __restrict__ w,
-    const float* __restrict__ dyn,
+    const void* __restrict__ dyn,
     const int64_t* __restrict__ ctl,
-    float* __restrict__ out,
+    void* __restrict__ out,
+    const void* __restrict__ add,
     const int S,
     const int C,
     const int R,
     const int k,
     const int heads,
-    const float scale
+    const float scale,
+    const int flags
 )
 {
     const int idx = blockIdx.x * I2_THREADS + threadIdx.x;
     if (idx >= S * C) return;
     const int s = idx / C, c = idx % C;
     const int64_t pos = ctl[0];
-    #define I2_X(si) (X_HALF ? __half2float(((const half*) x_)[(size_t) (si) * C + c]) : ((const float*) x_)[(size_t) (si) * C + c])
+    // A float input counts as its fp16 rounding (I2C_X_ROUND): the value the ring keeps, and the one a later step
+    // or a prefill reads for this position
+    #define I2_X(si) (X_HALF ? __half2float(((const half*) x_)[(size_t) (si) * C + c]) : \
+        ((flags & I2C_X_ROUND) ? __half2float(__float2half_rn(((const float*) x_)[(size_t) (si) * C + c])) : ((const float*) x_)[(size_t) (si) * C + c]))
     const float xv = I2_X(s);
-    const float* dt = dyn ? dyn + ((size_t) s * heads + c / (C / heads)) * k : nullptr;
+    // The token's taps: float [k] in tap order, or (I2C_DYN_HALF_REV) half [k] in reverse order, as projected
+    const size_t dbase = ((size_t) s * heads + c / (C / heads)) * k;
+    #define I2_DYN(j) (!dyn ? 0.0f : (flags & I2C_DYN_HALF_REV) ? __half2float(((const half*) dyn)[dbase + k - 1 - (j)]) : ((const float*) dyn)[dbase + (j)])
     float acc = 0.0f;
     for (int j = 0; j < k - 1; ++j)
     {
@@ -47,12 +58,17 @@ __global__ void i2_conv_step_kernel
         // ring rows read here are never among the rows this launch writes
         const int si = s - (k - 1) + j;
         const float in = si >= 0 ? I2_X(si) : __half2float(ring[(size_t) ((pos + si) % R) * C + c]);
-        acc += (w[c * k + j] + (dt ? dt[j] : 0.0f)) * in;
+        acc += (w[c * k + j] + I2_DYN(j)) * in;
     }
-    acc += (w[c * k + k - 1] + (dt ? dt[k - 1] : 0.0f)) * xv;
-    out[(size_t) s * C + c] = (acc + xv) * scale;
+    acc += (w[c * k + k - 1] + I2_DYN(k - 1)) * xv;
+    float res = (acc + xv) * scale;
+    if (add)
+        res = ((flags & I2C_ADD_HALF) ? __half2float(((const half*) add)[idx]) : ((const float*) add)[idx]) + res;
+    if (flags & I2C_OUT_HALF) ((half*) out)[idx] = __float2half_rn(res);
+    else ((float*) out)[idx] = res;
     ring[(size_t) ((pos + s) % R) * C + c] = __float2half_rn(xv);
     #undef I2_X
+    #undef I2_DYN
 }
 
 void i2_conv_step
@@ -63,7 +79,9 @@ void i2_conv_step
     const c10::optional<at::Tensor>& dyn,
     const at::Tensor& ctl,
     at::Tensor out,
-    float scale
+    float scale,
+    const c10::optional<at::Tensor>& add,
+    bool round_x
 )
 {
     const at::cuda::OptionalCUDAGuard device_guard(x.device());
@@ -72,32 +90,45 @@ void i2_conv_step
     const int S = (int) x.size(0), C = (int) x.size(1);
     TORCH_CHECK(ring.dim() == 2 && ring.size(1) == C && ring.scalar_type() == at::kHalf, "i2_conv_step: ring");
     TORCH_CHECK(w.dim() == 2 && w.size(0) == C && w.scalar_type() == at::kFloat && w.is_contiguous(), "i2_conv_step: w");
-    TORCH_CHECK(out.numel() == (int64_t) S * C && out.scalar_type() == at::kFloat, "i2_conv_step: out");
+    TORCH_CHECK(out.numel() == (int64_t) S * C && (out.scalar_type() == at::kFloat || out.scalar_type() == at::kHalf), "i2_conv_step: out");
+    int flags = (round_x ? I2C_X_ROUND : 0) | (out.scalar_type() == at::kHalf ? I2C_OUT_HALF : 0);
+    const void* ap = nullptr;
+    if (add.has_value())
+    {
+        const at::Tensor& a = add.value();
+        TORCH_CHECK(a.numel() == (int64_t) S * C && a.is_contiguous() && (a.scalar_type() == at::kFloat || a.scalar_type() == at::kHalf), "i2_conv_step: add");
+        if (a.scalar_type() == at::kHalf) flags |= I2C_ADD_HALF;
+        ap = a.data_ptr();
+    }
     TORCH_CHECK(ctl.scalar_type() == at::kLong, "i2_conv_step: ctl");
     TORCH_CHECK(x.is_contiguous() && ring.is_contiguous() && out.is_contiguous(), "i2_conv_step: contiguity");
     const int k = (int) w.size(1);
     TORCH_CHECK(k >= 1 && k <= I2_MAX_TAPS && S + k - 1 <= ring.size(0), "i2_conv_step: taps / ring size");
-    const float* dp = nullptr;
+    const void* dp = nullptr;
     int heads = 1;
     if (dyn.has_value())
     {
         const at::Tensor& d = dyn.value();
-        TORCH_CHECK(d.dim() == 3 && d.size(0) == S && d.size(2) == k && d.scalar_type() == at::kFloat && d.is_contiguous(), "i2_conv_step: dyn");
-        TORCH_CHECK(C % d.size(1) == 0, "i2_conv_step: heads");
-        heads = (int) d.size(1);
-        dp = (const float*) d.data_ptr();
+        TORCH_CHECK(d.is_contiguous() && d.size(0) == S && d.numel() % ((int64_t) S * k) == 0, "i2_conv_step: dyn");
+        if (d.scalar_type() == at::kHalf)
+            flags |= I2C_DYN_HALF_REV;      // half [S, heads * k], taps in reverse order (the projection's output)
+        else
+            TORCH_CHECK(d.dim() == 3 && d.size(2) == k && d.scalar_type() == at::kFloat, "i2_conv_step: dyn must be float [S, heads, k]");
+        heads = (int) (d.numel() / ((int64_t) S * k));
+        TORCH_CHECK(C % heads == 0, "i2_conv_step: heads");
+        dp = d.data_ptr();
     }
     const int blocks = CEIL_DIVIDE(S * C, I2_THREADS);
     if (x.scalar_type() == at::kHalf)
         i2_conv_step_kernel<true><<<blocks, I2_THREADS, 0, stream>>>(
             x.data_ptr(), (half*) ring.data_ptr(), (const float*) w.data_ptr(), dp, (const int64_t*) ctl.data_ptr(),
-            (float*) out.data_ptr(), S, C, (int) ring.size(0), k, heads, scale);
+            out.data_ptr(), ap, S, C, (int) ring.size(0), k, heads, scale, flags);
     else
     {
         TORCH_CHECK(x.scalar_type() == at::kFloat, "i2_conv_step: x dtype");
         i2_conv_step_kernel<false><<<blocks, I2_THREADS, 0, stream>>>(
             x.data_ptr(), (half*) ring.data_ptr(), (const float*) w.data_ptr(), dp, (const int64_t*) ctl.data_ptr(),
-            (float*) out.data_ptr(), S, C, (int) ring.size(0), k, heads, scale);
+            out.data_ptr(), ap, S, C, (int) ring.size(0), k, heads, scale, flags);
     }
     cuda_check(cudaPeekAtLastError());
 }
@@ -225,6 +256,90 @@ void i2_attn_res
         i2_attn_res_kernel<false><<<dim3(nq, S), I2R_THREADS, 0, stream>>>(
             bp, hidden.data_ptr(), (const float*) queries.data_ptr(), (float*) out.data_ptr(), n, S, D, eps);
     }
+    cuda_check(cudaPeekAtLastError());
+}
+
+// ---------------------------------------------------------------------------------------------------------------
+// RMS norm with an optional gain, one block per row; output half or float
+
+template <bool X_HALF, bool O_HALF>
+__launch_bounds__(I2R_THREADS)
+__global__ void i2_norm_kernel
+(
+    const void* __restrict__ x_,
+    const float* __restrict__ w,
+    void* __restrict__ out_,
+    const int D,
+    const int nw,
+    const int rows_per_w,
+    const float eps
+)
+{
+    __shared__ float part[I2R_WARPS];
+    __shared__ float rn_s;
+    const int t = threadIdx.x;
+    const int lane = t & 31, warp = t >> 5;
+    const size_t row = blockIdx.x;
+    const size_t off = row * D;
+    if (w) w += (size_t) (nw > 1 ? row / rows_per_w : 0) * D;
+    #define I2N_X(i) (X_HALF ? __half2float(((const half*) x_)[off + (i)]) : ((const float*) x_)[off + (i)])
+    float acc = 0.0f;
+    for (int i = t; i < D; i += I2R_THREADS) { const float v = I2N_X(i); acc += v * v; }
+    for (int o = 16; o > 0; o >>= 1) acc += __shfl_xor_sync(0xffffffff, acc, o);
+    if (lane == 0) part[warp] = acc;
+    __syncthreads();
+    if (warp == 0)
+    {
+        float v = part[lane];
+        for (int o = 16; o > 0; o >>= 1) v += __shfl_xor_sync(0xffffffff, v, o);
+        if (lane == 0) rn_s = rsqrtf(v / (float) D + eps);
+    }
+    __syncthreads();
+    const float rn = rn_s;
+    for (int i = t; i < D; i += I2R_THREADS)
+    {
+        float v = I2N_X(i) * rn;
+        if (w) v *= w[i];
+        if (O_HALF) ((half*) out_)[off + i] = __float2half_rn(v);
+        else ((float*) out_)[off + i] = v;
+    }
+    #undef I2N_X
+}
+
+void i2_norm
+(
+    const at::Tensor& x,
+    const c10::optional<at::Tensor>& w,
+    at::Tensor out,
+    float eps
+)
+{
+    const at::cuda::OptionalCUDAGuard device_guard(x.device());
+    cudaStream_t stream = at::cuda::getCurrentCUDAStream().stream();
+    TORCH_CHECK(x.dim() >= 2 && x.is_contiguous(), "i2_norm: x must be [..., D], contiguous");
+    const int D = (int) x.size(-1);
+    const int rows = (int) (x.numel() / D);
+    TORCH_CHECK(out.numel() == x.numel() && out.is_contiguous(), "i2_norm: out");
+    const float* wp = nullptr;
+    int nw = 1;
+    if (w.has_value())
+    {
+        const at::Tensor& wt = w.value();
+        TORCH_CHECK(wt.scalar_type() == at::kFloat && wt.is_contiguous() && wt.size(-1) == D, "i2_norm: w");
+        nw = (int) (wt.numel() / D);
+        TORCH_CHECK(nw >= 1 && rows % nw == 0, "i2_norm: rows per gain");
+        wp = (const float*) wt.data_ptr();
+    }
+    const bool xh = x.scalar_type() == at::kHalf, oh = out.scalar_type() == at::kHalf;
+    TORCH_CHECK(xh || x.scalar_type() == at::kFloat, "i2_norm: x dtype");
+    TORCH_CHECK(oh || out.scalar_type() == at::kFloat, "i2_norm: out dtype");
+    #define I2N_LAUNCH(XH, OH) i2_norm_kernel<XH, OH><<<rows, I2R_THREADS, 0, stream>>>( \
+        x.data_ptr(), wp, out.data_ptr(), D, nw, rows / nw, eps)
+    if (xh && oh) I2N_LAUNCH(true, true);
+    else if (xh) I2N_LAUNCH(true, false);
+    else if (oh) I2N_LAUNCH(false, true);
+    else I2N_LAUNCH(false, false);
+    #undef I2N_LAUNCH
     cuda_check(cudaPeekAtLastError());
 }
 
@@ -510,15 +625,17 @@ __launch_bounds__(I2A_THREADS)
 __global__ void i2_attn_merge_kernel
 (
     const float* __restrict__ part,
-    const float* __restrict__ sinks,
+    const void* __restrict__ sinks,
     const int64_t* __restrict__ ctl,
-    float* out,
+    void* out_,
+    const half* __restrict__ ogate,
     const int G,
     const int Hk,
     const int dh,
     const int blocks,
     const bool local,
-    const int64_t window
+    const int64_t window,
+    const bool sinks_half
 )
 {
     __shared__ float red[I2A_THREADS];
@@ -530,8 +647,9 @@ __global__ void i2_attn_merge_kernel
     const int nb = (int) ((n + I2A_KB - 1) / I2A_KB);
     const float* pb = part + ((((size_t) tok * Hk + hk) * blocks) * G + g) * (2 + dh);
     const size_t step = (size_t) G * (2 + dh);
-    const float sink = sinks[(size_t) tok * Hk * G + h];
-    out += (size_t) tok * Hk * G * dh;
+    const size_t si = (size_t) tok * Hk * G + h;
+    const float sink = sinks_half ? __half2float(((const half*) sinks)[si]) : ((const float*) sinks)[si];
+    const size_t obase = (size_t) tok * Hk * G * dh;
 
     float mx = -INFINITY;
     for (int b = t; b < nb; b += I2A_THREADS) mx = fmaxf(mx, pb[b * step]);
@@ -571,7 +689,16 @@ __global__ void i2_attn_merge_kernel
     {
         float sum = 0.0f;
         for (int c = 0; c < chains; ++c) sum += red[c * I2A_MDIMS + t];
-        out[(size_t) h * dh + dim] = sum / den;
+        const size_t oi = obase + (size_t) h * dh + dim;
+        if (ogate)
+        {
+            // The gated output, fp16: the attention output is rounded to fp16 first, as the unfused chain does
+            const float o = __half2float(__float2half_rn(sum / den));
+            const float gt = 1.0f / (1.0f + expf(-__half2float(ogate[oi])));
+            ((half*) out_)[oi] = __float2half_rn(o * gt);
+        }
+        else
+            ((float*) out_)[oi] = sum / den;
     }
 }
 
@@ -591,7 +718,8 @@ void i2_attn_one
     int64_t base,
     int64_t window,
     int64_t capacity,
-    float scale
+    float scale,
+    const c10::optional<at::Tensor>& ogate
 )
 {
     const at::cuda::OptionalCUDAGuard device_guard(q.device());
@@ -608,8 +736,15 @@ void i2_attn_one
     const int dr = (int) rel.size(2);
     TORCH_CHECK(proj.dim() == 2 && proj.size(0) == dr && proj.scalar_type() == at::kFloat && proj.is_contiguous(), "i2_attn_one: proj");
     const int extent = (int) proj.size(1);
-    TORCH_CHECK(sinks.numel() == (int64_t) S * H && sinks.scalar_type() == at::kFloat && sinks.is_contiguous(), "i2_attn_one: sinks");
-    TORCH_CHECK(out.numel() == (int64_t) S * H * dh && out.scalar_type() == at::kFloat && out.is_contiguous(), "i2_attn_one: out");
+    TORCH_CHECK(sinks.numel() == (int64_t) S * H && (sinks.scalar_type() == at::kFloat || sinks.scalar_type() == at::kHalf) && sinks.is_contiguous(), "i2_attn_one: sinks");
+    const half* gp = nullptr;
+    if (ogate.has_value())
+    {
+        const at::Tensor& og = ogate.value();
+        TORCH_CHECK(og.numel() == (int64_t) S * H * dh && og.scalar_type() == at::kHalf && og.is_contiguous(), "i2_attn_one: ogate");
+        gp = (const half*) og.data_ptr();
+    }
+    TORCH_CHECK(out.numel() == (int64_t) S * H * dh && out.scalar_type() == (gp ? at::kHalf : at::kFloat) && out.is_contiguous(), "i2_attn_one: out");
     TORCH_CHECK(ctl.scalar_type() == at::kLong && ctl.numel() >= 2, "i2_attn_one: ctl");
     const int blocks = (int) CEIL_DIVIDE(local ? window : capacity, (int64_t) I2A_KB);
     TORCH_CHECK(part.scalar_type() == at::kFloat && part.numel() >= (int64_t) S * Hk * blocks * G * (2 + dh), "i2_attn_one: part");
@@ -626,8 +761,8 @@ void i2_attn_one
         (float*) part.data_ptr(), G, Hk, dh, dr, extent, blocks, local, base, window, scale);
     dim3 mgrid(H, CEIL_DIVIDE(dh, I2A_MDIMS), S);
     i2_attn_merge_kernel<<<mgrid, I2A_THREADS, 0, stream>>>(
-        (const float*) part.data_ptr(), (const float*) sinks.data_ptr(), (const int64_t*) ctl.data_ptr(),
-        (float*) out.data_ptr(), G, Hk, dh, blocks, local, window);
+        (const float*) part.data_ptr(), sinks.data_ptr(), (const int64_t*) ctl.data_ptr(),
+        out.data_ptr(), gp, G, Hk, dh, blocks, local, window, sinks.scalar_type() == at::kHalf);
     cuda_check(cudaPeekAtLastError());
 }
 

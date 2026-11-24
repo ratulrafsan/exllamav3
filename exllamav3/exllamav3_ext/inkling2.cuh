@@ -16,6 +16,9 @@
 // itself), dyn: optional float [S, heads, k] added to the taps of each head's channels.
 // out[s, c] = (sum_j taps[c, j] * input[s - (k - 1) + j][c] + x[s, c]) * scale, float [S, C]; inputs before the
 // first token come from the ring. Writes x into the ring rows of the tokens.
+// dyn may instead be half [S, heads * k] with each head's taps in reverse order (the projection as it comes).
+// add: optional [S, C] (half or float) added to the result (a residual). out may be half. round_x: a float x is
+// rounded to fp16 before use (the value the ring keeps).
 void i2_conv_step
 (
     const at::Tensor& x,
@@ -24,7 +27,19 @@ void i2_conv_step
     const c10::optional<at::Tensor>& dyn,
     const at::Tensor& ctl,
     at::Tensor out,
-    float scale
+    float scale,
+    const c10::optional<at::Tensor>& add = c10::nullopt,
+    bool round_x = false
+);
+
+// RMS norm of each row of x ([..., D], half or float) times an optional gain w (float [D], or [nw, D]: consecutive
+// groups of rows / nw rows take gain 0, 1, ...). out: the same number of elements, half or float.
+void i2_norm
+(
+    const at::Tensor& x,
+    const c10::optional<at::Tensor>& w,
+    at::Tensor out,
+    float eps
 );
 
 // Block attention residual. blocks: optional float [n, S, D] (already RMS-normalized), hidden: [S, D] (half or
@@ -94,6 +109,8 @@ void i2_qkv_post
 //   part: float scratch [S * Hk * blocks * G * (2 + dh)], blocks = the key capacity / 32 (the launch grid; blocks
 //         past a token's keys return at once)
 //   out: float [S, H, dh]
+//   sinks may be half. ogate: optional half [S, H * dh]: out is then half, the fp16-rounded attention output
+//   times sigmoid(ogate)
 void i2_attn_one
 (
     const at::Tensor& q,
@@ -110,7 +127,8 @@ void i2_attn_one
     int64_t base,
     int64_t window,
     int64_t capacity,
-    float scale
+    float scale,
+    const c10::optional<at::Tensor>& ogate = c10::nullopt
 );
 
 // Prefill attention (many queries of one sequence), in three steps that keep fp32 accuracy while the matrix

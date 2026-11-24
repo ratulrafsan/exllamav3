@@ -253,10 +253,11 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
     m.def("add_sigmoid_gate_proj", &add_sigmoid_gate_proj, "add_sigmoid_gate_proj");
     m.def("add", &add, "add");
     // Local patch: Inkling-2 decode-step kernels
-    m.def("i2_conv_step", &i2_conv_step, "i2_conv_step");
+    m.def("i2_conv_step", &i2_conv_step, "i2_conv_step", py::arg("x"), py::arg("ring"), py::arg("w"), py::arg("dyn"), py::arg("ctl"), py::arg("out"), py::arg("scale"), py::arg("add") = py::none(), py::arg("round_x") = false);
+    m.def("i2_norm", &i2_norm, "i2_norm");
     m.def("i2_attn_res", &i2_attn_res, "i2_attn_res");
     m.def("i2_message_gate", &i2_message_gate, "i2_message_gate");
-    m.def("i2_attn_one", &i2_attn_one, "i2_attn_one");
+    m.def("i2_attn_one", &i2_attn_one, "i2_attn_one", py::arg("q"), py::arg("rel"), py::arg("sinks"), py::arg("proj"), py::arg("k_store"), py::arg("v_store"), py::arg("pages"), py::arg("ctl"), py::arg("part"), py::arg("out"), py::arg("local"), py::arg("base"), py::arg("window"), py::arg("capacity"), py::arg("scale"), py::arg("ogate") = py::none());
     m.def("i2_qkv_post", &i2_qkv_post, "i2_qkv_post");
     m.def("i2_attn_qk", &i2_attn_qk, "i2_attn_qk");
     m.def("i2_attn_soft", &i2_attn_soft, "i2_attn_soft");

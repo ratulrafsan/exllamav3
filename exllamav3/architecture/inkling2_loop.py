@@ -325,9 +325,10 @@ class Exl3Experts:
             out_dtype = torch.float,
         )
 
-    def _moe(self, x: torch.Tensor, adt: torch.dtype) -> torch.Tensor:
+    def _moe(self, x: torch.Tensor, adt: torch.dtype | None) -> torch.Tensor:
+        # adt None: the kernels' fp32 output as it is (the caller rounds it)
         y = self.mlp.forward(x.to(torch.half).unsqueeze(0).contiguous(), self.params, torch.float)
-        return y[0].to(adt)
+        return y[0] if adt is None else y[0].to(adt)
 
     def gate_up(self, e, x):
         xh = x.to(torch.half).contiguous()
@@ -523,6 +524,15 @@ class _KernelOps:
         self.ext = ext
         self.has_attn = hasattr(ext, "i2_attn_one") and os.environ.get("EXL3_I2_ATTN_KERNEL", "1") != "0"
         self.has_qkv = self.has_attn and hasattr(ext, "i2_qkv_post") and os.environ.get("EXL3_I2_QKV_KERNEL", "1") != "0"
+        # Norm + gain + cast as one kernel, and the residuals, casts and output gate inside the convolution and
+        # attention kernels (EXL3_I2_FUSE=0: the PyTorch operations between the kernels, for comparison)
+        self.fused = self.has_qkv and hasattr(ext, "i2_norm") and os.environ.get("EXL3_I2_FUSE", "1") != "0"
+
+    def norm(self, x, w, dtype, eps):
+        """RMS norm over the last dimension times the gain w ([D], or one row per leading index of x), as dtype"""
+        out = torch.empty(x.shape, dtype = dtype, device = x.device)
+        self.ext.i2_norm(x, w, out, eps)
+        return out
 
     def attn_res(self, blocks, hidden, query, eps):
         S, D = hidden.shape
@@ -531,9 +541,10 @@ class _KernelOps:
         self.ext.i2_attn_res(blocks, hidden, q, out, eps)
         return out[0] if query.dim() == 1 else out
 
-    def message_gate(self, x, message, w_down, w_forget, w_gain, eps):
+    def message_gate(self, x, message, w_down, w_forget, w_gain, eps, out = None):
         S, D = x.shape
-        out = torch.empty((S, D), dtype = torch.float32, device = x.device)
+        if out is None:
+            out = torch.empty((S, D), dtype = torch.float32, device = x.device)
         g = torch.empty((S, w_down.shape[0]), dtype = torch.float32, device = x.device)
         # The kernel reads forget / gain as [r, D]; the transposed copies are made once and kept on the tensors
         wt = []
@@ -567,10 +578,18 @@ class _GraphCacheView:
         self.ctl = ctl
         self.kops = consts.get("kops")
 
-    def conv_step(self, name: str, x: torch.Tensor, w: torch.Tensor, scale: float, dyn: torch.Tensor | None = None):
-        """Convolution over the ring's history and x [S, C], and the ring writes, in one kernel; fp32 [S, C]"""
-        out = torch.empty(x.shape, dtype = torch.float32, device = x.device)
-        self.kops.ext.i2_conv_step(x, self.rsl.conv[name][self.slot], w, dyn, self.ctl, out, scale)
+    def conv_step(self, name: str, x: torch.Tensor, w: torch.Tensor, scale: float, dyn: torch.Tensor | None = None,
+                  add: torch.Tensor | None = None, round_x: bool = False, out_dtype = torch.float32):
+        """
+        Convolution over the ring's history and x [S, C], and the ring writes, in one kernel; [S, C] (fp32 unless
+        out_dtype says otherwise). add: a residual added to the result; round_x: an fp32 x counts as its fp16
+        rounding
+        """
+        out = torch.empty(x.shape, dtype = out_dtype, device = x.device)
+        if add is None and not round_x:
+            self.kops.ext.i2_conv_step(x, self.rsl.conv[name][self.slot], w, dyn, self.ctl, out, scale)
+        else:
+            self.kops.ext.i2_conv_step(x, self.rsl.conv[name][self.slot], w, dyn, self.ctl, out, scale, add, round_x)
         return out
 
     def record(self, name: str, x: torch.Tensor):
@@ -619,19 +638,27 @@ class _GraphCacheView:
 _capture_streams = {}
 
 
-def _graph_attend(self, q, rel, sinks, proj, scale):
-    """_GraphCacheView.attend: the attention kernel over this layer application's keys. fp32 [S, H, dh]"""
+def _graph_attend(self, q, rel, sinks, proj, scale, ogate = None):
+    """
+    _GraphCacheView.attend: the attention kernel over this layer application's keys. fp32 [S, H, dh]; with ogate
+    (fp16 [S, H * dh]) the output gate is applied as well and the result is fp16
+    """
     rsl, ext = self.rsl, self.kops.ext
     S, H, dh = q.shape
-    out = torch.empty((S, H, dh), dtype = torch.float32, device = q.device)
-    qf, rf, sf = q.float(), rel.float(), sinks.float()
+    qf, rf = q.float(), rel.float()
+    if ogate is None:
+        out = torch.empty((S, H, dh), dtype = torch.float32, device = q.device)
+        sf, extra = sinks.float(), ()
+    else:
+        out = torch.empty((S, H, dh), dtype = torch.half, device = q.device)
+        sf, extra = sinks, (ogate,)             # the kernel reads the fp16 sinks as they are
     part = self.consts["part"]                  # scratch shared by every layer application on this device
     if self.cl is None:
         ext.i2_attn_one(qf, rf, sf, proj, rsl.k_state[self.slot], rsl.v_state[self.slot], None, self.ctl, part, out,
-                        True, 0, rsl.window, rsl.window, scale)
+                        True, 0, rsl.window, rsl.window, scale, *extra)
     else:
         ext.i2_attn_one(qf, rf, sf, proj, self.cl.k, self.cl.v, self.consts["pages"] if self.base < 0 else None,
-                        self.ctl, part, out, False, max(self.base, 0), 0, self.cap, scale)
+                        self.ctl, part, out, False, max(self.base, 0), 0, self.cap, scale, *extra)
     return out
 
 
@@ -1014,7 +1041,8 @@ class Inkling2Head(_I2Module):
                 st.to(self.device)
             # The forward loop may have cut the hidden state to the last tokens (last_tokens_only)
             blocks = st.blocks[:, -n:]
-            fin = I2.final_hidden(self.Hd, x[b], blocks, adt)
+            g = params.get("i2_graph")
+            fin = I2.final_hidden(self.Hd, x[b], blocks, adt, None if g is None else g["consts"][self.device]["kops"])
             finals.append(fin)
             out.append(I2.logits_from_hidden(self.Hd, fin))
         if _wants_tap(params, len(self.config.i2.applications)):
