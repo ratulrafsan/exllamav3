@@ -359,8 +359,26 @@ void i2_message_gate
 #define I2A_MAX_DH 128
 #define I2A_MDIMS 16            // value dimensions per merge block
 
-// A GPU thread is slow at long serial chains, so a block takes few keys and splits every sum over many threads:
-// 8 threads per key for the scores, 2 threads per value dimension for the weighted sums.
+// Eight halves from one 16-byte load
+__device__ __forceinline__ void i2_load8(const half* p, float* f)
+{
+    const uint4 w = *((const uint4*) p);
+    f[0] = __half2float(__ushort_as_half((unsigned short) (w.x & 0xffff)));
+    f[1] = __half2float(__ushort_as_half((unsigned short) (w.x >> 16)));
+    f[2] = __half2float(__ushort_as_half((unsigned short) (w.y & 0xffff)));
+    f[3] = __half2float(__ushort_as_half((unsigned short) (w.y >> 16)));
+    f[4] = __half2float(__ushort_as_half((unsigned short) (w.z & 0xffff)));
+    f[5] = __half2float(__ushort_as_half((unsigned short) (w.z >> 16)));
+    f[6] = __half2float(__ushort_as_half((unsigned short) (w.w & 0xffff)));
+    f[7] = __half2float(__ushort_as_half((unsigned short) (w.w >> 16)));
+}
+
+#define I2A_SPAN (I2A_MAX_DH / I2A_PARTS)       // dimensions per thread: 16
+
+// A block takes 32 keys. Thread t takes key t % 32 (its lane) and one eighth of the head dimensions (its warp), for
+// the scores and again for the weighted values, and reads its 16 halves of K or V with two 16-byte loads: the kernel
+// is bound by memory traffic, and a load of one half per instruction reaches a third of the bandwidth. Sums over
+// the keys of a block are warp-shuffle reductions.
 __launch_bounds__(I2A_THREADS)
 __global__ void i2_attn_part_kernel
 (
@@ -385,9 +403,8 @@ __global__ void i2_attn_part_kernel
 )
 {
     __shared__ float qs[I2A_MAX_G][I2A_MAX_DH];
-    __shared__ float pd[I2A_MAX_G][I2A_THREADS];
-    __shared__ float scs[I2A_MAX_G][I2A_KB];
-    __shared__ int64_t rows[I2A_KB];
+    __shared__ float pd[I2A_MAX_G][I2A_PARTS][I2A_KB];
+    __shared__ float es[I2A_MAX_G][I2A_KB];
 
     const int hk = blockIdx.x, b = blockIdx.y, tok = blockIdx.z, t = threadIdx.x;
     const int H = Hk * G;
@@ -404,37 +421,46 @@ __global__ void i2_attn_part_kernel
     for (int i = t; i < G * dh; i += I2A_THREADS) qs[i / dh][i % dh] = q[(size_t) hk * G * dh + i];
     __syncthreads();
 
-    // Scores: thread t takes key t / 8 and one eighth of its dimensions
-    const int key = t / I2A_PARTS, pt = t % I2A_PARTS;
+    const int key = t & (I2A_KB - 1), pt = t / I2A_KB;
     const int64_t j = (int64_t) b * I2A_KB + key;
     const bool valid = j < n;
     const int64_t d = n - 1 - j;
     const int64_t p = pos - d;
     const int64_t row = !valid ? 0 : (local ? cpos - d : (pages ? pages[p >> 8] * 256 + (p & 255) : base + p));
+    const size_t off = ((size_t) row * Hk + hk) * dh + pt * I2A_SPAN;
+
+    // Scores
+    float f[I2A_SPAN];
     float s[I2A_MAX_G];
     for (int g = 0; g < G; ++g) s[g] = 0.0f;
     if (valid)
     {
-        const int span = dh / I2A_PARTS;
-        const half* kp = k_store + ((size_t) row * Hk + hk) * dh + pt * span;
-        for (int i = 0; i < span; ++i)
+        i2_load8(k_store + off, f);
+        i2_load8(k_store + off + 8, f + 8);
+        for (int g = 0; g < G; ++g)
         {
-            const float kv = __half2float(kp[i]);
-            for (int g = 0; g < G; ++g) s[g] += qs[g][pt * span + i] * kv;
+            float a0 = 0.0f, a1 = 0.0f;
+            for (int i = 0; i < I2A_SPAN; i += 2)
+            {
+                a0 += qs[g][pt * I2A_SPAN + i] * f[i];
+                a1 += qs[g][pt * I2A_SPAN + i + 1] * f[i + 1];
+            }
+            s[g] = a0 + a1;
         }
     }
-    for (int g = 0; g < G; ++g) pd[g][t] = s[g];
+    for (int g = 0; g < G; ++g) pd[g][pt][key] = s[g];
     __syncthreads();
+
+    // Per head: the scores of the 32 keys with bias, their maximum, exponentials and sum (the first warp)
     if (pt == 0)
     {
-        rows[key] = row;
         for (int g = 0; g < G; ++g)
         {
             float v = -INFINITY;
             if (valid)
             {
                 v = 0.0f;
-                for (int e = 0; e < I2A_PARTS; ++e) v += pd[g][t + e];
+                for (int e = 0; e < I2A_PARTS; ++e) v += pd[g][e][key];
                 v *= scale;
                 if (d < extent)
                 {
@@ -444,48 +470,39 @@ __global__ void i2_attn_part_kernel
                     v += bias;
                 }
             }
-            scs[g][key] = v;
+            float m = v;
+            for (int o = 16; o > 0; o >>= 1) m = fmaxf(m, __shfl_xor_sync(0xffffffff, m, o));
+            const float e = valid ? expf(v - m) : 0.0f;
+            float den = e;
+            for (int o = 16; o > 0; o >>= 1) den += __shfl_xor_sync(0xffffffff, den, o);
+            es[g][key] = e;
+            if (key == 0)
+            {
+                po[(size_t) g * (2 + dh)] = m;
+                po[(size_t) g * (2 + dh) + 1] = den;
+            }
         }
     }
     __syncthreads();
 
-    // Block maximum, exponentials and their sum: one thread per head over the 32 keys
-    if (t < G)
+    // Weighted value sums over the keys: per thread 16 dimensions of its key, summed over the lanes
+    if (valid)
     {
-        float m = -INFINITY;
-        for (int kk = 0; kk < I2A_KB; ++kk) m = fmaxf(m, scs[t][kk]);
-        float den = 0.0f;
-        for (int kk = 0; kk < I2A_KB; ++kk)
-        {
-            const float e = expf(scs[t][kk] - m);
-            scs[t][kk] = e;
-            den += e;
-        }
-        po[(size_t) t * (2 + dh)] = m;
-        po[(size_t) t * (2 + dh) + 1] = den;
+        i2_load8(v_store + off, f);
+        i2_load8(v_store + off + 8, f + 8);
     }
-    __syncthreads();
-
-    // Weighted value sums: thread t takes dimension t % dh and every (threads / dh)-th key
-    const int chains = I2A_THREADS / dh;
-    const int dim = t % dh, chain = t / dh;
-    float acc[I2A_MAX_G];
-    for (int g = 0; g < G; ++g) acc[g] = 0.0f;
-    const int nk = (int) min((int64_t) I2A_KB, n - (int64_t) b * I2A_KB);
-    for (int kk = chain; kk < nk; kk += chains)
+    else
+        for (int i = 0; i < I2A_SPAN; ++i) f[i] = 0.0f;
+    for (int g = 0; g < G; ++g)
     {
-        const float vv = __half2float(v_store[((size_t) rows[kk] * Hk + hk) * dh + dim]);
-        for (int g = 0; g < G; ++g) acc[g] += scs[g][kk] * vv;
-    }
-    for (int g = 0; g < G; ++g) pd[g][t] = acc[g];
-    __syncthreads();
-    if (t < dh)
-        for (int g = 0; g < G; ++g)
+        const float w = es[g][key];
+        for (int i = 0; i < I2A_SPAN; ++i)
         {
-            float v = 0.0f;
-            for (int c = 0; c < chains; ++c) v += pd[g][c * dh + t];
-            po[(size_t) g * (2 + dh) + 2 + t] = v;
+            float v = w * f[i];
+            for (int o = 16; o > 0; o >>= 1) v += __shfl_xor_sync(0xffffffff, v, o);
+            if (key == 0) po[(size_t) g * (2 + dh) + 2 + pt * I2A_SPAN + i] = v;
         }
+    }
 }
 
 // Merge of a head's blocks with the sink: one block per (head, 16 value dimensions)
@@ -586,7 +603,7 @@ void i2_attn_one
     const int Hk = (int) k_store.size(-2);
     TORCH_CHECK(k_store.size(-1) == dh && H % Hk == 0, "i2_attn_one: heads");
     const int G = H / Hk;
-    TORCH_CHECK(G <= I2A_MAX_G && dh <= I2A_MAX_DH && I2A_THREADS % dh == 0 && dh % I2A_PARTS == 0, "i2_attn_one: geometry");
+    TORCH_CHECK(G <= I2A_MAX_G && dh == I2A_MAX_DH && I2A_THREADS == I2A_KB * I2A_PARTS && I2A_KB == 32, "i2_attn_one: geometry");
     TORCH_CHECK(rel.dim() == 3 && rel.size(0) == S && rel.size(1) == H && rel.scalar_type() == at::kFloat && rel.is_contiguous(), "i2_attn_one: rel");
     const int dr = (int) rel.size(2);
     TORCH_CHECK(proj.dim() == 2 && proj.size(0) == dr && proj.scalar_type() == at::kFloat && proj.is_contiguous(), "i2_attn_one: proj");
