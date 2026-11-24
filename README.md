@@ -293,16 +293,16 @@ TabbyAPI must also run the exllamav3 of this branch, with the extension built fr
 
 #### Published conversions
 
-Conversions made with the script below are on Hugging Face, in the repository [ratulrafsan/Inkling-2-Mini-exl3-6.0bpw](https://huggingface.co/ratulrafsan/Inkling-2-Mini-exl3-6.0bpw). They load only with this branch.
+Conversions made with the script below are on Hugging Face, in the repository [ratulrafsan/Inkling-2-Mini-EXL3](https://huggingface.co/ratulrafsan/Inkling-2-Mini-EXL3). They load only with this branch.
 
 | Branch | Experts | Weight files | State |
 |---|---|---|---|
-| [`main`](https://huggingface.co/ratulrafsan/Inkling-2-Mini-exl3-6.0bpw/tree/main) | 6 bpw, last 4 layers 8 bpw | 21.7 GiB | The conversion all results in this section refer to, unless a table says otherwise |
-| [`4.5bpw`](https://huggingface.co/ratulrafsan/Inkling-2-Mini-exl3-6.0bpw/tree/4.5bpw) | 4.5 bpw: 5 bpw for layers 6 to 15 and 20 to 21, 4 bpw for the others | 16.5 GiB | Work in progress. Checked through TabbyAPI at a context of 262,144 tokens: short chats, images, a 251,619-token prompt |
+| [`main`](https://huggingface.co/ratulrafsan/Inkling-2-Mini-EXL3/tree/main) | 6 bpw, last 4 layers 8 bpw | 21.7 GiB | The conversion all results in this section refer to, unless a table says otherwise |
+| [`4.5bpw`](https://huggingface.co/ratulrafsan/Inkling-2-Mini-EXL3/tree/4.5bpw) | 4.5 bpw: 5 bpw for layers 6 to 15 and 20 to 21, 4 bpw for the others | 16.5 GiB | Work in progress. Checked through TabbyAPI at a context of 262,144 tokens: short chats, images, a 251,619-token prompt |
 
 ```
-hf download ratulrafsan/Inkling-2-Mini-exl3-6.0bpw --local-dir Inkling-2-Mini-exl3-6.0bpw
-hf download ratulrafsan/Inkling-2-Mini-exl3-6.0bpw --revision 4.5bpw --local-dir Inkling-2-Mini-exl3-4.5bpw
+hf download ratulrafsan/Inkling-2-Mini-EXL3 --local-dir Inkling-2-Mini-EXL3-6.0bpw
+hf download ratulrafsan/Inkling-2-Mini-EXL3 --revision 4.5bpw --local-dir Inkling-2-Mini-EXL3-4.5bpw
 ```
 
 Both include the vision tower and `mtp.safetensors` as stored in the source checkpoint. Refer to [Other bit rates](#other-bit-rates) for the quality and speed of each.
