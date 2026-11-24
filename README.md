@@ -291,6 +291,22 @@ TabbyAPI must also run the exllamav3 of this branch, with the extension built fr
 | `autosplit_reserve` | Enough for the whole loop to be on one GPU. On the RTX 4090 + RTX 3090 with a cache of 163,840 tokens: `[2560, 1024]` |
 | Draft model (optional) | `draft_mode: model`, `draft_num_tokens: 7`, `dynamic_draft: true`, and a `draft_gpu_split` that puts the draft model on the second GPU (`[0, 8]` on this system) |
 
+#### Published conversions
+
+Conversions made with the script below are on Hugging Face, in the repository [ratulrafsan/Inkling-2-Mini-exl3-6.0bpw](https://huggingface.co/ratulrafsan/Inkling-2-Mini-exl3-6.0bpw). They load only with this branch.
+
+| Branch | Experts | Weight files | State |
+|---|---|---|---|
+| [`main`](https://huggingface.co/ratulrafsan/Inkling-2-Mini-exl3-6.0bpw/tree/main) | 6 bpw, last 4 layers 8 bpw | 21.7 GiB | The conversion all results in this section refer to, unless a table says otherwise |
+| [`4.5bpw`](https://huggingface.co/ratulrafsan/Inkling-2-Mini-exl3-6.0bpw/tree/4.5bpw) | 4.5 bpw: 5 bpw for layers 6 to 15 and 20 to 21, 4 bpw for the others | 16.5 GiB | Work in progress. Checked through TabbyAPI at a context of 262,144 tokens: short chats, images, a 251,619-token prompt |
+
+```
+hf download ratulrafsan/Inkling-2-Mini-exl3-6.0bpw --local-dir Inkling-2-Mini-exl3-6.0bpw
+hf download ratulrafsan/Inkling-2-Mini-exl3-6.0bpw --revision 4.5bpw --local-dir Inkling-2-Mini-exl3-4.5bpw
+```
+
+Both include the vision tower and `mtp.safetensors` as stored in the source checkpoint. Refer to [Other bit rates](#other-bit-rates) for the quality and speed of each.
+
 #### Convert the model
 
 The source checkpoint has the experts only in NVFP4 (layers 0 to 19) and MXFP8 (layers 20 to 23). There is no full-precision release. The stock converter (`convert.py`) cannot run a looped model, so the conversion has its own script:
@@ -320,12 +336,12 @@ The same measure on ExLlamaV3's benchmark trace (`eval/qbench_prompts.py`: conve
 |---|---|---|---|---|---|
 | Source checkpoint | - | - | - | 1.6276 | - |
 | Source checkpoint with bf16 activations (noise floor) | - | 0.0017 | - | 1.6273 | - |
-| 6 bpw, last 4 layers 8 bpw (the published conversion) | 21.7 GiB | 0.0020 | 0.0003 | 1.6261 | 11.2 ms (89 T/s) |
+| 6 bpw, last 4 layers 8 bpw (published, branch `main`) | 21.7 GiB | 0.0020 | 0.0003 | 1.6261 | 11.2 ms (89 T/s) |
 | 5 bpw | 17.9 GiB | 0.0032 | 0.0014 | 1.6305 | 10.7 ms (93 T/s) |
-| 4.5 bpw (mix) | 16.5 GiB | 0.0042 | 0.0025 | 1.6328 | 10.3 ms (97 T/s) |
+| 4.5 bpw (mix; published, branch `4.5bpw`) | 16.5 GiB | 0.0042 | 0.0025 | 1.6328 | 10.3 ms (97 T/s) |
 | 4 bpw | 15.0 GiB | 0.0061 | 0.0044 | 1.6355 | 9.5 ms (105 T/s) |
 
-- The decode step is from `util/inkling2/graph_profile.py` at 2K tokens of context, with a cache of 163,840 tokens on the RTX 4090 + RTX 3090. At 4 bpw the whole model and the cache are on the RTX 4090. The lower rates were not run through TabbyAPI or with a long prompt.
+- The decode step is from `util/inkling2/graph_profile.py` at 2K tokens of context, with a cache of 163,840 tokens on the RTX 4090 + RTX 3090. At 4 bpw the whole model and the cache are on the RTX 4090. The 4.5 bpw conversion was also run through TabbyAPI at a context of 262,144 tokens: 95 T/s on short chats (6 bpw: 83 T/s at that context, where part of its loop is on the second GPU) and a 251,619-token prompt without errors. The 4 and 5 bpw conversions were not run through TabbyAPI.
 - The last four layers (MXFP8 in the source) matter little: with them at 8 bpw, the KL is 0.0031 at 5 bpw and 0.0056 at 4 bpw.
 - For comparison, upstream pull request #621 reports 0.0064 at 4 bpw, 0.0100 at 3.5 bpw and 0.0156 at 3 bpw with the same prompt set and measure. Its trace was sampled on another system (reference perplexity 1.99), and its conversions also quantize the attention projections and the output head, so the numbers are close but not the same test.
 
