@@ -874,15 +874,23 @@ class Inkling2Layer(_I2Module):
     @override
     def autosplit_extra_measure(self, params):
         # The measuring forward runs one chunk at context 0. With a long history a global layer's attention holds
-        # more: one block of logits (I2.ATTN_MAX_ELEMS, about as much again while it is normalized) and the fp32
-        # copies of a block of keys and values
+        # more: one block of logits (I2.ATTN_MAX_ELEMS) and the attention weights made from them, and a copy of
+        # the sequence's keys and values when its cache pages are not contiguous
         if not self.is_global or not self.cache_layers:
             return
         c = self.config.i2
-        logits = torch.empty((2 * I2.ATTN_MAX_ELEMS,), dtype = torch.float, device = self.device)
-        rows = min(self.cache_layers[0].max_num_tokens, I2.ATTN_KV_FP32_BYTES // (c.kv_heads * c.head_dim * 4))
-        kv = torch.empty((2, rows, c.kv_heads, c.head_dim), dtype = torch.float, device = self.device)
+        rows = self.cache_layers[0].max_num_tokens
         kv_half = torch.empty((2, rows, c.kv_heads, c.head_dim), dtype = torch.half, device = self.device)
+        if I2._prefill_ext() is not None and self.config.activation_dtype == torch.half:
+            # Extension path: fp32 logits, the weights as two fp16 terms; K and V are read as stored
+            logits = torch.empty((I2.ATTN_MAX_ELEMS,), dtype = torch.float, device = self.device)
+            weights = torch.empty((2 * I2.ATTN_MAX_ELEMS,), dtype = torch.half, device = self.device)
+            del logits, weights, kv_half
+            return
+        # PyTorch path: about twice the logits while they are normalized, and fp32 copies of a block of K and V
+        logits = torch.empty((2 * I2.ATTN_MAX_ELEMS,), dtype = torch.float, device = self.device)
+        rows = min(rows, I2.ATTN_KV_FP32_BYTES // (c.kv_heads * c.head_dim * 4))
+        kv = torch.empty((2, rows, c.kv_heads, c.head_dim), dtype = torch.float, device = self.device)
         del logits, kv, kv_half
 
     @override
