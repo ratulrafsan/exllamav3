@@ -510,6 +510,8 @@ def clean_response_for_context(tokenizer, response_ids: torch.Tensor) -> str:
         for stop in ("<|return|>", "<|end|>", "<|call|>"):
             text = text.split(stop)[0]
         return text.strip()
+    if "<|message_model|>" in full and "<|content_text|>" in full:    # Inkling-2 (local patch): the last text message
+        return full.rsplit("<|content_text|>", 1)[1].split("<|end_message|>")[0].strip()
     plain = tokenizer.decode(response_ids, decode_special_tokens = False)
     if "</think>" in plain:                                # qwen/deepseek style
         plain = plain.rsplit("</think>", 1)[1]

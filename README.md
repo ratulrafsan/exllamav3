@@ -312,6 +312,23 @@ Quality against the source checkpoint over 20,480 tokens (`util/inkling2/quality
 | Source checkpoint with bf16 activations (noise floor) | 0.00245 | 97.64% | 8.4478 |
 | EXL3, 6 bpw | 0.00282 | 97.49% | 8.4452 |
 
+##### Other bit rates
+
+The same measure on ExLlamaV3's benchmark trace (`eval/qbench_prompts.py`: conversations from a fixed prompt set, sampled from the model itself; 25 conversations, 46,740 scored tokens) with the code of `eval/qbench` (`util/inkling2/qbench_trace.py`, `util/inkling2/qbench_i2.py`). The expert layers were quantized at 4 and at 5 bits from the same calibration data, and assembled with `util/inkling2/assemble_variant.py`. EXL3 has whole bit rates above 3.5, so 4.5 bpw is a mix: 5 bits for layers 6 to 15 and 20 to 21, 4 bits for the others.
+
+| Experts | Weight files | KL to the source (mean) | KL above the noise floor | Perplexity | Decode step |
+|---|---|---|---|---|---|
+| Source checkpoint | - | - | - | 1.6276 | - |
+| Source checkpoint with bf16 activations (noise floor) | - | 0.0017 | - | 1.6273 | - |
+| 6 bpw, last 4 layers 8 bpw (the published conversion) | 21.7 GiB | 0.0020 | 0.0003 | 1.6261 | 11.2 ms (89 T/s) |
+| 5 bpw | 17.9 GiB | 0.0032 | 0.0014 | 1.6305 | 10.7 ms (93 T/s) |
+| 4.5 bpw (mix) | 16.5 GiB | 0.0042 | 0.0025 | 1.6328 | 10.3 ms (97 T/s) |
+| 4 bpw | 15.0 GiB | 0.0061 | 0.0044 | 1.6355 | 9.5 ms (105 T/s) |
+
+- The decode step is from `util/inkling2/graph_profile.py` at 2K tokens of context, with a cache of 163,840 tokens on the RTX 4090 + RTX 3090. At 4 bpw the whole model and the cache are on the RTX 4090. The lower rates were not run through TabbyAPI or with a long prompt.
+- The last four layers (MXFP8 in the source) matter little: with them at 8 bpw, the KL is 0.0031 at 5 bpw and 0.0056 at 4 bpw.
+- For comparison, upstream pull request #621 reports 0.0064 at 4 bpw, 0.0100 at 3.5 bpw and 0.0156 at 3 bpw with the same prompt set and measure. Its trace was sampled on another system (reference perplexity 1.99), and its conversions also quantize the attention projections and the output head, so the numbers are close but not the same test.
+
 > [!NOTE]
 > The top-k expert routing of this model is discontinuous. Two runs that differ only by rounding give logits that differ by 2 to 3%. The "noise floor" line shows this effect. Do not compare outputs token by token without it.
 
