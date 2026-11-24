@@ -52,7 +52,7 @@ The settings for this system are in the TabbyAPI configuration and start script.
 | Pipelined prefill with CPU experts | Lets the two GPUs work on different prefill chunks when the CPU expert split is on. This is a port of [a commit by Auryn Macmillan](https://github.com/auryn-macmillan/exllamav3/commit/b38de78bd0376fcdc4f92344ed405800ac8374b6). The port also adds a lock to the n-gram row table. Prefill of prompts longer than one chunk is approximately 10% faster. `EXL3_PIPELINED_PREFILL=0` turns it off. |
 | Late promote hook | Moves the promote-on-miss step off the critical path of decode and makes its budget a setting. Decode is approximately 17% faster on this system. Refer to [Late promote hook](#late-promote-hook). |
 | Expert lookahead (experimental, off by default) | Predicts the experts of the next split layer and copies them from RAM to VRAM before the layer needs them. It needs a source build of the extension. On this system it makes decode slower. Refer to [Expert lookahead](#expert-lookahead). |
-| Inkling-2-Mini (work in progress) | Adds the looped Inkling-2 model (text and image input): load from the source checkpoint or from an EXL3 conversion of its experts, cache, generator, CUDA-graph decode and decode kernels. It needs a source build of the extension for full speed. Refer to [Inkling-2-Mini](#inkling-2-mini). |
+| Inkling-2-Mini (work in progress) | Adds the looped Inkling-2 model (text and image input): load from the source checkpoint or from an EXL3 conversion of its experts, cache, generator, CUDA-graph decode and decode kernels. It needs a source build of the extension for full speed, and TabbyAPI needs the patch `util/inkling2/tabbyapi_inkling2.patch`. Refer to [Inkling-2-Mini](#inkling-2-mini). |
 
 ### Late promote hook
 
@@ -236,13 +236,13 @@ The layer math and the NVFP4 / MXFP8 dequantizers are adapted from [0xSero/inkli
 |---|---|
 | Load from the source checkpoint (experts stay in NVFP4 / MXFP8) | Works. 17.6 GiB of VRAM. Slow: approximately 6 T/s. |
 | EXL3 conversion of the experts | Works. Refer to [Convert the model](#convert-the-model). |
-| Cache, generator, tabbyAPI | Works. Each loop pass has its own cache layers. FP16 cache only. |
+| Cache, generator, tabbyAPI | Works. TabbyAPI needs the patch in [Use with TabbyAPI](#use-with-tabbyapi). Each loop pass has its own cache layers. FP16 cache only. |
 | Context length | Tested with a 161,543-token prompt on the RTX 4090 + RTX 3090, with and without the draft model. |
 | Decode as CUDA graph replays, with decode kernels | Works for one sequence with EXL3 experts. |
 | Multi-token graph steps (verify drafted tokens) | Works for a maximum of 8 tokens in one forward pass. The MTP draft model uses them. |
 | Prefill | Attention and the block attention residual run through the extension (cuBLAS products on fp16 inputs with fp32 accumulation, own kernels). The rest is plain PyTorch. The pipelined prefill of the generator is off for this model. Refer to [Limits](#limits). |
 | MTP head (`mtp.safetensors`, DSpark draft model) | Works as a draft model (`architecture/inkling2_dspark.py`), in the Python API and in TabbyAPI (`draft_mode: model`, `draft_num_tokens: 7`, `dynamic_draft: true`; the model directory comes from `util/inkling2/make_dspark_dir.py`). Refer to the TabbyAPI results below. Not quantized. |
-| Vision | Works: the vision tower is the `vision` component of the model (`architecture/inkling2_vision.py`), in the Python API and in TabbyAPI (`vision: true`, with the TabbyAPI patch below). Refer to [Images](#images). |
+| Vision | Works: the vision tower is the `vision` component of the model (`architecture/inkling2_vision.py`), in the Python API and in TabbyAPI (`vision: true`, with the TabbyAPI patch). Refer to [Images](#images). |
 | Tensor parallelism | Not supported. |
 
 #### Requirements
@@ -261,6 +261,35 @@ python setup.py build_ext --build-lib ../exl3_build/lib --build-temp ../exl3_bui
 ```
 
 Then put `exl3_build/lib` first on `PYTHONPATH`.
+
+#### Use with TabbyAPI
+
+> [!IMPORTANT]
+> TabbyAPI needs a patch to serve this model: `util/inkling2/tabbyapi_inkling2.patch` in this repository. Apply it to the TabbyAPI checkout before you load the model.
+
+```
+# in the root of the TabbyAPI checkout
+git apply /path/to/exllamav3/util/inkling2/tabbyapi_inkling2.patch
+```
+
+The patch is made against TabbyAPI commit `4728158` (2026-11-14). It adds:
+
+- **The Inkling-2 message format.** The model writes each part of its reply as a message with a content type (`<|content_thinking|>`, `<|content_text|>`, `<|content_invoke_tool_json|>`). The patch detects the format from the tokenizer and splits the output into reasoning, answer and tool calls, for streaming and non-streaming requests.
+- **The tool call format** (`endpoints/OAI/utils/toolcall_formats/inkling2.py`).
+- **Image parts.** TabbyAPI joins the parts of a message into one text. The model needs each image as a message of its own, so the patch gives the parts to the chat template as a list and puts the image tokens where the template writes its image placeholder.
+
+Without the patch, TabbyAPI does not separate reasoning from the answer, does not parse tool calls, and puts images inside a text message, which is not the format of the model.
+
+TabbyAPI must also run the exllamav3 of this branch, with the extension built from source (refer to [Requirements](#requirements)). Settings in the TabbyAPI configuration that this model needs:
+
+| Setting | Value |
+|---|---|
+| `backend` | `exllamav3` |
+| `cache_mode` | `FP16` |
+| `cuda_malloc_async` | `false` |
+| `vision` | `true`, for image input |
+| `autosplit_reserve` | Enough for the whole loop to be on one GPU. On the RTX 4090 + RTX 3090 with a cache of 163,840 tokens: `[2560, 1024]` |
+| Draft model (optional) | `draft_mode: model`, `draft_num_tokens: 7`, `dynamic_draft: true`, and a `draft_gpu_split` that puts the draft model on the second GPU (`[0, 8]` on this system) |
 
 #### Convert the model
 
@@ -382,7 +411,7 @@ prompt = effort + "<|message_user|><|content_image|>" + image.text_alias + "<|en
 text = generator.generate(prompt = prompt, embeddings = [image], encode_special_tokens = True, ...)
 ```
 
-TabbyAPI concatenates the parts of a message into one text, which puts the image inside a text message. `patches/tabby_inkling2_format.patch` of the TabbyAPI checkout gives the parts to the chat template as a list when the vision model names an image placeholder (`image_placeholder`), and replaces each placeholder in the rendered prompt with the alias of an image.
+TabbyAPI concatenates the parts of a message into one text, which puts the image inside a text message. The TabbyAPI patch (refer to [Use with TabbyAPI](#use-with-tabbyapi)) gives the parts to the chat template as a list when the vision model names an image placeholder (`image_placeholder`), and replaces each placeholder in the rendered prompt with the alias of an image.
 
 Checks (`util/inkling2/vision_check.py` against `util/inkling2/ref_dump_vision.py`, three test images):
 

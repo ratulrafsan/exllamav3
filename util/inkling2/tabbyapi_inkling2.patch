@@ -1,0 +1,290 @@
+diff --git a/backends/exllamav3/model.py b/backends/exllamav3/model.py
+index 63972f9..c072dd5 100644
+--- a/backends/exllamav3/model.py
++++ b/backends/exllamav3/model.py
+@@ -241,6 +241,7 @@ class ExllamaV3Container:
+     tool_format: Optional[str] = None
+     harmony: bool = False
+     muse_glimmer: bool = False
++    inkling2: bool = False
+     reasoning_budget_tokens: Optional[int] = None
+     reasoning_budget_message: Optional[str] = None
+ 
+@@ -858,10 +859,22 @@ class ExllamaV3Container:
+                     "settings in the model config; they will be ignored."
+                 )
+ 
+-        # Resolve "auto" reasoning tokens. Harmony and Glimmer carry reasoning
+-        # in their message structure, so tags don't apply there
++        # Inkling-2 message format (content-type tokens). Detected from the
++        # tokenizer like the two above, or selected with tool_format: inkling2
++        inkling_tokens = (
++            "<|message_model|>", "<|content_text|>", "<|content_thinking|>", "<|end_message|>"
++        )
++        self.inkling2 = not self.harmony and not self.muse_glimmer and (
++            self.tool_format in ("inkling2", "inkling2_loop")
++            or all(self.tokenizer.single_id(token) is not None for token in inkling_tokens)
++        )
++        if self.inkling2:
++            xlogger.info("Using the Inkling-2 message format for reasoning and tool call parsing.")
++
++        # Resolve "auto" reasoning tokens. Harmony, Glimmer and Inkling carry
++        # reasoning in their message structure, so tags don't apply there
+         reasoning_evidence = "config"
+-        if self.harmony or self.muse_glimmer:
++        if self.harmony or self.muse_glimmer or self.inkling2:
+             self.reasoning_start_token = None
+             self.reasoning_end_token = None
+         elif self.reasoning and not self.reasoning_explicit:
+@@ -883,6 +896,8 @@ class ExllamaV3Container:
+             summary = "Harmony message format"
+         elif self.muse_glimmer:
+             summary = "Muse Glimmer message format"
++        elif self.inkling2:
++            summary = "Inkling-2 message format"
+         else:
+             parts = []
+             if self.tool_format:
+diff --git a/endpoints/OAI/utils/chat_completion.py b/endpoints/OAI/utils/chat_completion.py
+index 99a317c..399513d 100644
+--- a/endpoints/OAI/utils/chat_completion.py
++++ b/endpoints/OAI/utils/chat_completion.py
+@@ -45,6 +45,7 @@ from endpoints.OAI.utils.stream_parser import (
+     REASONING,
+     ChannelStreamParser,
+     GlimmerStreamParser,
++    InklingStreamParser,
+     HarmonyStreamParser,
+     TagStreamParser,
+ )
+@@ -141,8 +142,8 @@ def _resolve_start_in_reasoning(prompt: str, data: ChatCompletionRequest) -> boo
+     """Determine whether generation starts inside a reasoning block."""
+ 
+     mc = model.container
+-    if mc.harmony or mc.muse_glimmer:
+-        # Harmony and Glimmer message headers determine the channel; there
++    if mc.harmony or mc.muse_glimmer or getattr(mc, "inkling2", False):
++        # Harmony, Glimmer and Inkling message headers determine the channel; there
+         # is no ambiguity for the parser to resolve, except for a continued
+         # message, whose header is in the prompt
+         return _continued_field(data) == "reasoning_content"
+@@ -377,9 +378,32 @@ async def format_messages_with_template(
+     template_vars = unwrap(existing_template_vars, {})
+     mm_embeddings = MultimodalEmbeddingWrapper() if model.container.use_vision else None
+ 
++    # Local (Inkling-2): a vision model whose chat template renders image parts itself names the
++    # placeholder the template emits per image (image_placeholder). The content parts then reach the
++    # template as a list, and each placeholder in the rendered prompt is replaced by an image's alias.
++    # Inkling-2 needs this: an image is a message of its own (<|content_image|>), not text inside one.
++    image_placeholder = (
++        getattr(model.container.vision_model, "image_placeholder", None) if mm_embeddings else None
++    )
++
+     # Convert all messages to a dictionary representation
+     message_dicts: List[dict] = []
+     for message in messages:
++        if isinstance(message.content, list) and image_placeholder:
++            parts = []
++            for content in message.content:
++                if content.type == "text":
++                    parts.append({"type": "text", "text": content.text})
++                elif content.type == "image_url":
++                    await mm_embeddings.add(model.container, content.image_url.url)
++                    parts.append({"type": "image"})
++
++            message_dict = message.model_dump(exclude_none=True)
++            message_dict["content"] = parts
++            _expose_reasoning(message_dict)
++            message_dicts.append(message_dict)
++            continue
++
+         if isinstance(message.content, list):
+             concatenated_content = ""
+             for content in message.content:
+@@ -426,6 +450,17 @@ async def format_messages_with_template(
+     template_vars.update({"messages": message_dicts, **special_tokens_dict})
+ 
+     prompt = await model.container.prompt_template.render(template_vars)
++
++    if image_placeholder and mm_embeddings.text_alias:
++        found = prompt.count(image_placeholder)
++        if found != len(mm_embeddings.text_alias):
++            xlogger.warning(
++                f"The chat template rendered {found} image placeholders for "
++                f"{len(mm_embeddings.text_alias)} images."
++            )
++        for alias in mm_embeddings.text_alias:
++            prompt = prompt.replace(image_placeholder, alias, 1)
++
+     return prompt, mm_embeddings, template_vars
+ 
+ 
+@@ -757,6 +792,8 @@ def _reasoning_budget_injection(mc, message: str) -> Optional[str]:
+         suffix = "<|end|><|start|>assistant<|channel|>final<|message|>"
+     elif mc.muse_glimmer:
+         suffix = "<|eom|><|start|>assistant to=user<|message|>"
++    elif getattr(mc, "inkling2", False):
++        suffix = "<|end_message|><|message_model|><|content_text|>"
+     elif mc.reasoning and mc.reasoning_start_token and mc.reasoning_end_token:
+         suffix = mc.reasoning_end_token
+     else:
+@@ -814,6 +851,12 @@ async def _chat_stream_collector(
+         use_think = False
+         use_tool = False
+         parser = GlimmerStreamParser(initial_channel)
++    elif getattr(mc, "inkling2", False):
++        # Same for Inkling-2, with content-type tokens in place of channels
++        tool_format = "inkling2"
++        use_think = False
++        use_tool = False
++        parser = InklingStreamParser(initial_channel)
+     else:
+         tool_format = mc.tool_format
+         t_tool_start, t_tool_end = get_toolcall_tags(tool_format)
+diff --git a/endpoints/OAI/utils/stream_parser.py b/endpoints/OAI/utils/stream_parser.py
+index 5e9995d..e1a83c8 100644
+--- a/endpoints/OAI/utils/stream_parser.py
++++ b/endpoints/OAI/utils/stream_parser.py
+@@ -387,6 +387,53 @@ class GlimmerStreamParser(ChannelStreamParser):
+         return CONTENT
+ 
+ 
++class InklingStreamParser(ChannelStreamParser):
++    """
++    Splits generated text in the Inkling-2 message format into
++    reasoning/content/tool channels.
++
++    Every message starts with `<|message_model|>`, an optional name, then a
++    content-type token that opens the body; `<|end_message|>` ends it:
++
++        <|message_model|><|content_thinking|>...reasoning...<|end_message|>
++        <|message_model|><|content_text|>...content...<|end_message|>
++        <|message_model|>NAME<|content_invoke_tool_json|>{"name":"NAME","args":{...}}<|end_message|>
++
++    The content-type token, not the header, gives the channel. Generation
++    begins before the first `<|message_model|>`; the turn ends with
++    `<|content_model_end_sampling|>`, a stop token. Tool messages are parsed
++    with the "inkling2" tool format.
++    """
++
++    _BODY_TOKENS = {
++        "<|content_thinking|>": REASONING,
++        "<|content_text|>": CONTENT,
++        "<|content_invoke_tool_json|>": TOOL,
++    }
++    _TOKENS = ["<|message_model|>", "<|end_message|>", "<|content_model_end_sampling|>", *_BODY_TOKENS]
++    _TOOL_END = "<|end_message|>"
++
++    def _resolve_channel(self, header: str) -> str:
++        # Headers carry a tool name at most; text messages are the default
++        return CONTENT
++
++    def _handle_token(self, token: str, events: list):
++        channel = self._BODY_TOKENS.get(token)
++        if channel is not None:
++            if self._state == self._HEADER:
++                self._channel = channel
++                if channel == TOOL:
++                    events.append((TOOL, self._header + token))
++                self._state = self._BODY
++            return
++
++        # <|message_model|> and the end tokens begin a new message header
++        if self._state == self._BODY and self._channel == TOOL:
++            events.append((TOOL, self._TOOL_END))
++        self._state = self._HEADER
++        self._header = ""
++
++
+ def _merge_events(events: List[Tuple[str, str]]) -> List[Tuple[str, str]]:
+     """Merge consecutive events on the same channel."""
+ 
+diff --git a/endpoints/OAI/utils/toolcall_formats/inkling2.py b/endpoints/OAI/utils/toolcall_formats/inkling2.py
+new file mode 100644
+index 0000000..36a9f5e
+--- /dev/null
++++ b/endpoints/OAI/utils/toolcall_formats/inkling2.py
+@@ -0,0 +1,62 @@
++import json
++import re
++
++from common.logger import xlogger
++from endpoints.OAI.types.tools import ToolCall, Tool
++from endpoints.OAI.utils.toolcall_formats.common import FormatSignature
++
++"""
++Inkling-2 - structural message format with JSON tool calls
++
++A tool call is a model message named after the tool, with the
++`<|content_invoke_tool_json|>` content type. The Inkling stream parser emits
++each one on the tool channel as:
++
++    __NAME__<|content_invoke_tool_json|>{"name":"__NAME__","args":{...}}<|end_message|>
++
++The name inside the JSON body is authoritative; the header duplicates it.
++
++This format requires the Inkling stream parser and is selected automatically
++for Inkling-2 models; TOOLCALL_START/END are None since there are no tags for
++TagStreamParser to scan for.
++"""
++
++TOOLCALL_START = None
++TOOLCALL_END = None
++
++DETECT = FormatSignature(
++    template_markers=("<|content_invoke_tool_json|>", "<|message_model|>"),
++    special_tokens=("<|message_model|>", "<|content_invoke_tool_json|>", "<|end_message|>"),
++    architectures=("Inkling2",),
++    structured=True,
++)
++
++_CALL = re.compile(r"([^<]*)<\|content_invoke_tool_json\|>(.*?)(?:<\|end_message\|>|$)", re.DOTALL)
++
++
++def parse_toolcalls(text: str) -> list[ToolCall]:
++    results = []
++    for match in _CALL.finditer(text):
++        header, body = match.group(1).strip(), match.group(2).strip()
++        if not body:
++            continue
++        try:
++            call = json.loads(body)
++        except (json.JSONDecodeError, ValueError):
++            xlogger.warning("inkling2: Tool message body is not valid JSON", {"raw_text": body})
++            continue
++        if not isinstance(call, dict):
++            continue
++        name = call.get("name") or header
++        args = call.get("args", call.get("arguments", {}))
++        if not name:
++            continue
++        results.append(
++            ToolCall(function=Tool(name=name, arguments=json.dumps(args, ensure_ascii=False)))
++        )
++
++    xlogger.debug(
++        f"inkling2: Parsed {len(results)} tool calls",
++        {"raw_text": text, "results": results},
++    )
++    return results
+diff --git a/endpoints/OAI/utils/tools.py b/endpoints/OAI/utils/tools.py
+index 469439c..37d519f 100644
+--- a/endpoints/OAI/utils/tools.py
++++ b/endpoints/OAI/utils/tools.py
+@@ -14,6 +14,7 @@ from endpoints.OAI.utils.toolcall_formats import (
+     glm4_5,
+     harmony,
+     hy3,
++    inkling2,
+     muse_glimmer,
+     deepseek_v4,
+     deepseek_v41,
+@@ -46,6 +47,8 @@ ALL_TOOLCALL_FORMATS = {
+     "olmo3": olmo3,
+     "olmo": olmo3,
+     "hy3": hy3,
++    "inkling2": inkling2,
++    "inkling2_loop": inkling2,
+     "hy_v3": hy3,
+     "laguna": glm4_5,
+     "poolside_v1": glm4_5,
