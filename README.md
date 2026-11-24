@@ -239,9 +239,9 @@ The layer math and the NVFP4 / MXFP8 dequantizers are adapted from [0xSero/inkli
 | Cache, generator, tabbyAPI | Works. Each loop pass has its own cache layers. FP16 cache only. |
 | Context length | Tested with a 161,543-token prompt on the 3090 + 4090. |
 | Decode as CUDA graph replays, with decode kernels | Works for one sequence with EXL3 experts. |
-| Multi-token graph steps (verify drafted tokens) | Works for a maximum of 8 tokens in one forward pass. Nothing uses them yet. |
-| Prefill | Plain PyTorch (cuBLAS). |
-| MTP head (`mtp.safetensors`, DSpark draft model) | Works as a draft model (`architecture/inkling2_dspark.py`), in the Python API and in TabbyAPI (`draft_mode: model`, `draft_num_tokens: 7`; the model directory comes from `util/inkling2/make_dspark_dir.py`). TabbyAPI, greedy, 400 tokens, default reasoning effort, context 163,840, against 65.8 T/s without it: code 107–129 T/s, list 75–85, prose 70–73, essay 56–62. With `dynamic_draft: true` (confidence 0.4) the draft block is cut where the drafter is unsure: prose, list and essay gain 5–13%, code loses 4–17%. Not quantized. |
+| Multi-token graph steps (verify drafted tokens) | Works for a maximum of 8 tokens in one forward pass. The MTP draft model uses them. |
+| Prefill | Attention and the block attention residual run through the extension (cuBLAS products on fp16 inputs with fp32 accumulation, own kernels). The rest is plain PyTorch. |
+| MTP head (`mtp.safetensors`, DSpark draft model) | Works as a draft model (`architecture/inkling2_dspark.py`), in the Python API and in TabbyAPI (`draft_mode: model`, `draft_num_tokens: 7`; the model directory comes from `util/inkling2/make_dspark_dir.py`). TabbyAPI, greedy, 400 tokens, default reasoning effort, context 163,840, with `dynamic_draft: true` (confidence 0.4), against 74 T/s without the draft model: code 115–120 T/s, list 95, prose 81, essay 70. `dynamic_draft` cuts the draft block where the drafter is unsure; in an earlier build, prose, list and essay gained 5–13% from it and code lost 4–17%. Not quantized. |
 | Vision | Not implemented. |
 | Tensor parallelism | Not supported. |
 
@@ -292,6 +292,7 @@ Quality against the source checkpoint over 20,480 tokens (`util/inkling2/quality
 | `EXL3_I2_GRAPH` | `0` runs each decode step operation by operation, without CUDA graphs. | `1` |
 | `EXL3_I2_GRAPH_WIDTH` | The maximum number of tokens of one sequence in one forward pass that runs as a graph. | `8` |
 | `EXL3_I2_KERNELS` | `0` uses the PyTorch forms in the graph and not the decode kernels. | `1` |
+| `EXL3_I2_PREFILL_KERNEL` | `0` uses the PyTorch forms of attention and the block attention residual in prefill. | `1` |
 | `EXL3_I2_MOE` | `dense` runs the EXL3 experts in a slow reference loop. Use it to compare with `kernel`. | `kernel` |
 | `EXL3_I2_ADT` | The activation data type: `fp16`, `bf16` or `fp32`. The decode kernels need `fp16`. | `fp16` |
 | `EXL3_I2_NAN_CHECK` | `1` shows a line when a forward pass gives logits that are not finite. | `0` |
@@ -304,27 +305,37 @@ Decode (`util/inkling2/graph_check.py`):
 
 | Context (tokens) | Operation by operation | CUDA graph with kernels |
 |---|---|---|
-| 600 | 26 T/s | 72 T/s |
-| 2,000 | 26 T/s | 71 T/s |
-| 9,000 | 26 T/s | 67 T/s |
-| 30,000 | 25 T/s | 59 T/s |
+| 600 | 26 T/s | 81 T/s |
+| 2,000 | 26 T/s | 79 T/s |
+| 9,000 | 26 T/s | 77 T/s |
+| 30,000 | 26 T/s | 71 T/s |
+| 45,000 | 26 T/s | 67 T/s |
 
 Forward passes with more than one token of one sequence (`util/inkling2/graph_spec_check.py`):
 
 | Tokens | Operation by operation | Graph |
 |---|---|---|
-| 1 | 40.4 ms | 14.5 ms |
-| 2 | 61.3 ms | 18.5 ms |
-| 4 | 61.6 ms | 23.1 ms |
-| 8 | 61.8 ms | 30.0 ms |
+| 1 | 39.2 ms | 12.7 ms |
+| 2 | 54.6 ms | 16.2 ms |
+| 4 | 54.9 ms | 20.0 ms |
+| 8 | 56.2 ms | 25.9 ms |
+
+Prefill, one chunk of 2,048 tokens (`util/inkling2/component_bench.py`):
+
+| Context (tokens) | PyTorch forms (`EXL3_I2_PREFILL_KERNEL=0`) | With the extension |
+|---|---|---|
+| 0 | 772 ms (2,650 T/s) | 586 ms (3,500 T/s) |
+| 40,960 | 2,443 ms (840 T/s) | 1,064 ms (1,925 T/s) |
+
+Perplexity over 20,480 tokens (`util/inkling2/ppl_check.py`) is 8.4455 with the extension and 8.4470 with the PyTorch forms. The KL between the two is 0.0015, below the noise floor in the table above.
 
 Through tabbyAPI:
 
 | Test | Result |
 |---|---|
-| Short chats and tool calls | Approximately 65 T/s |
-| 9K-token prompt | Prefill 1,751 T/s, decode 61 T/s |
-| 44K-token prompt | Prefill 1,068 T/s |
+| Short chats | 74 T/s |
+| 10K-token prompt | Prefill 2,308 T/s, decode 68 T/s |
+| 49K-token prompt | Prefill 1,843 T/s, decode 56 T/s, correct answer to a question about a sentence at 10% depth |
 | 161,543-token prompt (older build, before the graph and kernel work) | Prefill 183 T/s, decode 12.9 T/s, correct answer to a question about a sentence at 10% depth |
 
 #### How the patch works
@@ -334,13 +345,14 @@ Through tabbyAPI:
 - The global layers keep K/V in the paged cache. The sliding layers keep the last window in a buffer for each sequence. All layers keep the last inputs of their convolutions in a ring.
 - A decode step is captured as one CUDA graph for each GPU. All cache indexes are computed on the GPU from two integers, so one captured graph is correct for all positions.
 - `exllamav3/exllamav3_ext/inkling2.cu` has five kernels that replace groups of small PyTorch operations in the graph: convolution, block attention residual, message gate, Q/K/V post-processing and attention.
+- Prefill attention has three steps for each chunk of queries, in the same file. `i2_attn_qk` computes the logits with cuBLAS from the fp16 values of Q and K, with fp32 accumulation. `i2_attn_soft` applies the scale, the relative bias, the masks and the exponentials in one kernel. `i2_attn_pv` multiplies the weights with V; each weight goes in as two fp16 terms, which keeps approximately 22 bits. K and V are read in place from the cache. The results have the accuracy of the fp32 PyTorch form.
 
 The checks in `util/inkling2/` compare the port with the transformers reference (`ref_dump.py`, `port_check.py`), cached decode with an uncached pass (`cache_check.py`) and graph decode with operation-by-operation decode (`graph_check.py`, `graph_seq_check.py`, `graph_spec_check.py`).
 
 #### Limits
 
 - Graph decode is for one sequence. Batches, prefill and forward passes wider than `EXL3_I2_GRAPH_WIDTH` run operation by operation.
-- Prefill at long context is slow. At 40K tokens of context, 84% of the prefill time is attention on the global layers.
+- Prefill slows down with the context. At 40K tokens of context, approximately half of the prefill time is attention on the global layers.
 - The checkpoint of the cache state is approximately 162 MiB, because it holds the attention window of all sliding layer applications.
 - A few experts that the model uses rarely saw very little calibration data (a minimum of 1 token in layer 22).
 - On one 44K-token test prompt, graph decode and operation-by-operation decode gave different answers. All step-by-step comparisons agree, so this is the routing effect in the note above, but it is not proven for all prompts. `EXL3_I2_GRAPH=0` is the switch to compare.
@@ -348,8 +360,8 @@ The checks in `util/inkling2/` compare the port with the transformers reference 
 #### TODO
 
 1. **MTP draft model: raise the gain on prose.** A verification pass of 8 tokens costs about 30 ms against 14.5 ms for one token, and on prose only 1–2 drafts per pass are accepted. Ideas: a cheaper narrow pass when the drafter is unsure (the passes are padded to 1, 2, 4 or 8 tokens, so a cut only pays when it crosses one of those), the draft block and the Markov chain in a CUDA graph (now about 4 ms per round), quantized draft weights.
-2. **Prefill attention.** A kernel that uses tensor cores for the global layers. A scalar kernel was tested and was 3 to 5 times slower than cuBLAS.
-3. **Decode.** Tune the block attention residual and gate kernels, and replace the remaining small PyTorch operations. The expert kernel (approximately 4.4 ms of 14 ms for each token) and memory bandwidth set the limit after that.
+2. **Prefill attention.** The logits of a chunk of queries are still written to memory and read back (two cuBLAS products with a kernel between them). One kernel with tensor cores that keeps the logits in shared memory can remove this traffic. The experts are now the largest part of prefill at short context (277 of 586 ms).
+3. **Decode.** Of 12.6 ms for each token, approximately 7.6 ms is memory traffic at 600 to 840 GB/s: the cuBLAS projections (2.9 ms), the expert kernels (3.5 ms) and the output head (1.1 ms). The rest is the own kernels (approximately 3 ms) and approximately 1,000 small PyTorch operations (approximately 1.5 ms), which fused kernels can replace. `util/inkling2/graph_profile.py` shows the list.
 4. **Graph steps wider than 8 tokens**, for the n-gram draft verification of tabbyAPI (65 tokens).
 5. **Batched decode** as graphs.
 6. **Vision tower.**
