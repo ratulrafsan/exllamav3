@@ -1,5 +1,6 @@
 from __future__ import annotations
 from typing_extensions import override
+import os
 import weakref
 import torch
 import torch.nn.functional as F
@@ -52,6 +53,16 @@ class Inkling2DSparkConfig(DFlashConfig):
         self.final_logit_softcapping = self.read_cfg(float, "final_logit_softcapping", 30.0)
         self.unpadded_vocab_size = self.read_cfg(int, "unpadded_vocab_size", self.vocab_size)
         self.is_causal = False
+        # Context window of the layers the checkpoint runs with full attention (layer 1): 0 = everything, as
+        # trained. EXL3_I2_DSPARK_WINDOW or "context_window" in the drafter's config.json limits it; drafts are
+        # verified by the target either way, so this only moves the acceptance rate and the cost of a round
+        self.context_window = int(os.environ.get("EXL3_I2_DSPARK_WINDOW", self.read_cfg(int, "context_window", 0)))
+
+    @override
+    def block_window(self, idx: int) -> tuple[int, int]:
+        if self.layer_types[idx] != "sliding_attention" and self.context_window > 0:
+            return self.context_window - 1, self.context_window - 1
+        return super().block_window(idx)
 
 
 class Inkling2DSparkParts(Module):

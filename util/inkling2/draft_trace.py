@@ -6,7 +6,7 @@ plain decoding of the same prompt. Shows where the drafter gains and where it lo
     python util/inkling2/draft_trace.py <EXL3 model dir> <dspark dir>
         [--conf 0.4] [--tokens 400] [--only essay prose] [--no-pad] [--brief]
 """
-import argparse, time
+import argparse, glob, os, time
 from collections import defaultdict
 import torch
 
@@ -17,6 +17,7 @@ PROMPTS = [
     ("list", "List the planets of the solar system in order from the sun, one per line, with one fact each."),
     ("essay", "Write a 250-word essay about the history of the printing press."),
     ("code2", "Write a Python class for an LRU cache with get and put, using only the standard library. Include a short usage example."),
+    ("quote", "Quote the first three paragraphs of the text above word for word, then stop."),
 ]
 FMT = "<|message_system|><|content_text|>Thinking effort level: 0.2<|end_message|><|message_user|><|content_text|>{}<|end_message|>"
 
@@ -33,6 +34,7 @@ def main():
     ap.add_argument("--tokens", type = int, default = 400); ap.add_argument("--cache", type = int, default = 16384)
     ap.add_argument("--conf", type = float, default = 0.4)
     ap.add_argument("--only", nargs = "*")
+    ap.add_argument("--context", type = int, default = 0, help = "tokens of unrelated text in front of each prompt")
     ap.add_argument("--no-pad", action = "store_true", help = "do not fill padded verification slots with drafts")
     ap.add_argument("--brief", action = "store_true", help = "one line per prompt")
     ap.add_argument("--rounds", action = "store_true", help = "print every round of the last run")
@@ -40,16 +42,29 @@ def main():
     from exllamav3 import Config, Model, Cache, Tokenizer, Generator
     from exllamav3.generator.sampler import ArgmaxSampler
     config = Config.from_directory(args.model); model = Model.from_config(config)
+    args.cache = max(args.cache, (args.context + 4096 + 255) // 256 * 256)
     cache = Cache(model, max_num_tokens = args.cache, max_batch_size = 1, max_history = 8)
     dconfig = Config.from_directory(args.draft); draft = Model.from_config(dconfig)
     dcache = Cache(draft, max_num_tokens = args.cache)
     draft.load(reserve_per_device = [3.0, 1.0])
     model.load(reserve_per_device = [3.0, 1.0])
     tok = Tokenizer.from_config(config)
+    filler = ""
+    if args.context:
+        here = os.path.dirname(os.path.abspath(__file__))
+        text = ""
+        for f in sorted(glob.glob(os.path.join(here, "..", "..", "eval", "eval_texts", "*.txt"))):
+            with open(f, encoding = "utf8") as fh:
+                text += fh.read() + "\n\n"
+        ids = tok.encode(text)
+        while ids.shape[1] < args.context:
+            ids = torch.cat([ids, ids], dim = 1)
+        filler = tok.decode(ids[:, : args.context])
+        filler = (filler[0] if isinstance(filler, list) else filler) + "\n\n"
     prompts = [p for p in PROMPTS if not args.only or p[0] in args.only]
 
     def run(gen, prompt):
-        out, res = gen.generate(prompt = FMT.format(prompt), max_new_tokens = args.tokens, sampler = ArgmaxSampler(),
+        out, res = gen.generate(prompt = FMT.format(filler + prompt), max_new_tokens = args.tokens, sampler = ArgmaxSampler(),
                                 stop_conditions = [config.eos_token_id], add_bos = False, encode_special_tokens = True,
                                 decode_special_tokens = True, completion_only = True, return_last_results = True)
         return out, res
