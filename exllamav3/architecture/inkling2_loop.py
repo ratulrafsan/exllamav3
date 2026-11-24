@@ -535,7 +535,14 @@ class _KernelOps:
         S, D = x.shape
         out = torch.empty((S, D), dtype = torch.float32, device = x.device)
         g = torch.empty((S, w_down.shape[0]), dtype = torch.float32, device = x.device)
-        self.ext.i2_message_gate(x, message, w_down, w_forget, w_gain, g, out, eps)
+        # The kernel reads forget / gain as [r, D]; the transposed copies are made once and kept on the tensors
+        wt = []
+        for w in (w_forget, w_gain):
+            t = getattr(w, "_i2_t", None)
+            if t is None:
+                t = w._i2_t = w.t().contiguous()
+            wt.append(t)
+        self.ext.i2_message_gate(x, message, w_down, wt[0], wt[1], g, out, eps)
         return out
 
 

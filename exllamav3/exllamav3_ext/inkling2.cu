@@ -105,8 +105,13 @@ void i2_conv_step
 // ---------------------------------------------------------------------------------------------------------------
 // Block attention residual: one block per query
 
+#define I2R_THREADS 1024
+#define I2R_WARPS (I2R_THREADS / 32)
+
+// One block of 1024 threads per (query, token): a thread takes two or three channels, and the partial sums are
+// reduced with warp shuffles (per warp, then over the warps by the first warp)
 template <bool H_HALF>
-__launch_bounds__(I2_THREADS)
+__launch_bounds__(I2R_THREADS)
 __global__ void i2_attn_res_kernel
 (
     const float* __restrict__ blocks,
@@ -119,11 +124,13 @@ __global__ void i2_attn_res_kernel
     const float eps
 )
 {
-    // partial sums per thread: [0] = sum of squares of hidden, [1] = q . hidden, [2 + s] = q . block s
-    __shared__ float part[I2_MAX_STATES + 2][I2_THREADS];
+    // partial sums per warp: [0] = sum of squares of hidden, [1] = q . hidden, [2 + s] = q . block s
+    __shared__ float part[I2_MAX_STATES + 2][I2R_WARPS];
+    __shared__ float tot[I2_MAX_STATES + 2];
     __shared__ float p[I2_MAX_STATES + 1];
     __shared__ float rn_s;
     const int t = threadIdx.x;
+    const int lane = t & 31, warp = t >> 5;
     const int tok = blockIdx.y;
     const float* q = queries + (size_t) blockIdx.x * D;
     float* o = out + ((size_t) blockIdx.x * S + tok) * D;
@@ -134,7 +141,7 @@ __global__ void i2_attn_res_kernel
 
     float acc[I2_MAX_STATES + 2];
     for (int s = 0; s < n + 2; ++s) acc[s] = 0.0f;
-    for (int i = t; i < D; i += I2_THREADS)
+    for (int i = t; i < D; i += I2R_THREADS)
     {
         const float h = H_HALF ? __half2float(((const half*) hidden_)[i]) : ((const float*) hidden_)[i];
         const float qv = q[i];
@@ -142,30 +149,38 @@ __global__ void i2_attn_res_kernel
         acc[1] += qv * h;
         for (int s = 0; s < n; ++s) acc[2 + s] += qv * blocks_t[s * bstep + i];
     }
-    for (int s = 0; s < n + 2; ++s) part[s][t] = acc[s];
-    __syncthreads();
-    for (int stride = I2_THREADS / 2; stride > 0; stride >>= 1)
+    for (int s = 0; s < n + 2; ++s)
     {
-        if (t < stride)
-            for (int s = 0; s < n + 2; ++s) part[s][t] += part[s][t + stride];
-        __syncthreads();
+        float v = acc[s];
+        for (int off = 16; off > 0; off >>= 1) v += __shfl_xor_sync(0xffffffff, v, off);
+        if (lane == 0) part[s][warp] = v;
     }
-    if (t == 0)
+    __syncthreads();
+    if (warp == 0)
     {
-        const float rn = rsqrtf(part[0][0] / (float) D + eps);
-        const float sc = rsqrtf((float) D);
-        // scores: blocks first, hidden last (the order of the stacked states)
-        float mx = part[1][0] * rn * sc;
-        for (int s = 0; s < n; ++s) mx = fmaxf(mx, part[2 + s][0] * sc);
-        float sum = 0.0f;
-        for (int s = 0; s < n; ++s) { p[s] = expf(part[2 + s][0] * sc - mx); sum += p[s]; }
-        p[n] = expf(part[1][0] * rn * sc - mx); sum += p[n];
-        for (int s = 0; s <= n; ++s) p[s] /= sum;
-        rn_s = rn;
+        for (int s = 0; s < n + 2; ++s)
+        {
+            float v = part[s][lane];
+            for (int off = 16; off > 0; off >>= 1) v += __shfl_xor_sync(0xffffffff, v, off);
+            if (lane == 0) tot[s] = v;
+        }
+        if (lane == 0)
+        {
+            const float rn = rsqrtf(tot[0] / (float) D + eps);
+            const float sc = rsqrtf((float) D);
+            // scores: blocks first, hidden last (the order of the stacked states)
+            float mx = tot[1] * rn * sc;
+            for (int s = 0; s < n; ++s) mx = fmaxf(mx, tot[2 + s] * sc);
+            float sum = 0.0f;
+            for (int s = 0; s < n; ++s) { p[s] = expf(tot[2 + s] * sc - mx); sum += p[s]; }
+            p[n] = expf(tot[1] * rn * sc - mx); sum += p[n];
+            for (int s = 0; s <= n; ++s) p[s] /= sum;
+            rn_s = rn;
+        }
     }
     __syncthreads();
     const float rn = rn_s;
-    for (int i = t; i < D; i += I2_THREADS)
+    for (int i = t; i < D; i += I2R_THREADS)
     {
         const float h = H_HALF ? __half2float(((const half*) hidden_)[i]) : ((const float*) hidden_)[i];
         float v = p[n] * h * rn;
@@ -202,12 +217,12 @@ void i2_attn_res
         bp = (const float*) b.data_ptr();
     }
     if (hidden.scalar_type() == at::kHalf)
-        i2_attn_res_kernel<true><<<dim3(nq, S), I2_THREADS, 0, stream>>>(
+        i2_attn_res_kernel<true><<<dim3(nq, S), I2R_THREADS, 0, stream>>>(
             bp, hidden.data_ptr(), (const float*) queries.data_ptr(), (float*) out.data_ptr(), n, S, D, eps);
     else
     {
         TORCH_CHECK(hidden.scalar_type() == at::kFloat, "i2_attn_res: hidden dtype");
-        i2_attn_res_kernel<false><<<dim3(nq, S), I2_THREADS, 0, stream>>>(
+        i2_attn_res_kernel<false><<<dim3(nq, S), I2R_THREADS, 0, stream>>>(
             bp, hidden.data_ptr(), (const float*) queries.data_ptr(), (float*) out.data_ptr(), n, S, D, eps);
     }
     cuda_check(cudaPeekAtLastError());
@@ -263,6 +278,7 @@ __global__ void i2_message_gate_g_kernel
     if (t == 0) g[blockIdx.x] = red[2][0];
 }
 
+// wf, wg: [r, D], so that the threads of a warp read neighbouring weights; four partial sums per dot product
 __launch_bounds__(I2_THREADS)
 __global__ void i2_message_gate_apply_kernel
 (
@@ -285,11 +301,18 @@ __global__ void i2_message_gate_apply_kernel
     __syncthreads();
     const int d = blockIdx.x * I2_THREADS + threadIdx.x;
     if (d >= D) return;
-    float f = 0.0f, gn = 0.0f;
-    const float* wfr = wf + (size_t) d * r;
-    const float* wgr = wg + (size_t) d * r;
-    for (int j = 0; j < r; ++j) { f += wfr[j] * gs[j]; gn += wgr[j] * gs[j]; }
-    out[d] = (1.0f - tanhf(f)) * x[d] + tanhf(gn) * m[d];
+    float f[4] = {0.0f, 0.0f, 0.0f, 0.0f}, gn[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+    int j = 0;
+    for (; j + 4 <= r; j += 4)
+        for (int u = 0; u < 4; ++u)
+        {
+            const float gv = gs[j + u];
+            f[u] += wf[(size_t) (j + u) * D + d] * gv;
+            gn[u] += wg[(size_t) (j + u) * D + d] * gv;
+        }
+    for (; j < r; ++j) { f[0] += wf[(size_t) j * D + d] * gs[j]; gn[0] += wg[(size_t) j * D + d] * gs[j]; }
+    const float fs = (f[0] + f[1]) + (f[2] + f[3]), gsum = (gn[0] + gn[1]) + (gn[2] + gn[3]);
+    out[d] = (1.0f - tanhf(fs)) * x[d] + tanhf(gsum) * m[d];
 }
 
 void i2_message_gate
@@ -311,8 +334,8 @@ void i2_message_gate
     TORCH_CHECK(wd.dim() == 2 && wd.size(1) == 2 * D && wd.scalar_type() == at::kHalf && wd.is_contiguous(), "i2_message_gate: wd");
     const int r = (int) wd.size(0);
     TORCH_CHECK(r <= I2_MAX_RANK, "i2_message_gate: rank");
-    TORCH_CHECK(wf.dim() == 2 && wf.size(0) == D && wf.size(1) == r && wf.scalar_type() == at::kFloat && wf.is_contiguous(), "i2_message_gate: wf");
-    TORCH_CHECK(wg.dim() == 2 && wg.size(0) == D && wg.size(1) == r && wg.scalar_type() == at::kFloat && wg.is_contiguous(), "i2_message_gate: wg");
+    TORCH_CHECK(wf.dim() == 2 && wf.size(0) == r && wf.size(1) == D && wf.scalar_type() == at::kFloat && wf.is_contiguous(), "i2_message_gate: wf must be [r, D]");
+    TORCH_CHECK(wg.dim() == 2 && wg.size(0) == r && wg.size(1) == D && wg.scalar_type() == at::kFloat && wg.is_contiguous(), "i2_message_gate: wg must be [r, D]");
     TORCH_CHECK(x.scalar_type() == at::kFloat && m.scalar_type() == at::kFloat && m.numel() == (int64_t) S * D, "i2_message_gate: x, m");
     TORCH_CHECK(out.numel() == (int64_t) S * D && out.scalar_type() == at::kFloat, "i2_message_gate: out");
     TORCH_CHECK(x.is_contiguous() && m.is_contiguous() && out.is_contiguous(), "i2_message_gate: contiguity");

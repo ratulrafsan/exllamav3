@@ -40,7 +40,8 @@ void i2_attn_res
 );
 
 // Message gate: out = (1 - tanh(Wf g)) * x + tanh(Wg g) * m with g = Wd [rmsnorm(x) | rmsnorm(m)], per token.
-// x, m: float [S, D], wd: half [r, 2D], wf, wg: float [D, r], g: float [S, r] scratch, out: float [S, D].
+// x, m: float [S, D], wd: half [r, 2D], wf, wg: the transposed weights, float [r, D], g: float [S, r] scratch,
+// out: float [S, D].
 void i2_message_gate
 (
     const at::Tensor& x,
