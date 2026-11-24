@@ -36,6 +36,7 @@ default (EXL3_I2_VISION_DEVICE = first | last | cpu | cuda:N): the first GPU is 
 CELL_FILL = -1.0                 # pad value, on the 0..255 scale
 MAX_SIDE = 4096                  # the model card: each image dimension between 40 and 4096 pixels
 ATTN_MAX_ELEMS = 1 << 27         # attention logits held at once: heads * queries * keys (fp32: 512 MB)
+FP16_ATTN_PATCHES = int(os.environ.get("EXL3_I2_VISION_FP16_PATCHES", 12000))   # more patches: fp16 attention
 
 
 def composite_on_checkerboard(rgba: np.ndarray) -> np.ndarray:
@@ -139,6 +140,12 @@ class Inkling2VisionTower(Module):
         step = max(1, ATTN_MAX_ELEMS // (H * L))
         if step >= L:
             return torch.softmax(torch.matmul(q, k.transpose(1, 2)) * d ** -0.5, dim = -1) @ v
+        if L > FP16_ATTN_PATCHES and q.is_cuda:
+            # A very large image: the fp32 form below takes most of a minute at 4096 x 4096 pixels. Attention alone
+            # in fp16 (PyTorch's fused kernel) is several times faster and still closer to fp32 than the bf16
+            # the reference runs the whole tower in
+            o = F.scaled_dot_product_attention(q.half().unsqueeze(0), k.half().unsqueeze(0), v.half().unsqueeze(0))
+            return o[0].float()
         out = torch.empty_like(q)
         kt = k.transpose(1, 2)
         for a in range(0, L, step):
