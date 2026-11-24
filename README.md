@@ -214,7 +214,7 @@ These are estimates. They are not tested.
 ### Inkling-2-Mini
 
 > [!WARNING]
-> This is work in progress. Text input only. The multi-token-prediction (MTP) head and the vision tower are not implemented.
+> This is work in progress. Text input only. The vision tower is not implemented. The draft model (the MTP head) works in the Python API; TabbyAPI does not load it yet.
 
 #### Overview
 
@@ -241,7 +241,7 @@ The layer math and the NVFP4 / MXFP8 dequantizers are adapted from [0xSero/inkli
 | Decode as CUDA graph replays, with decode kernels | Works for one sequence with EXL3 experts. |
 | Multi-token graph steps (verify drafted tokens) | Works for a maximum of 8 tokens in one forward pass. Nothing uses them yet. |
 | Prefill | Plain PyTorch (cuBLAS). |
-| MTP head (`mtp.safetensors`) | Not implemented. |
+| MTP head (`mtp.safetensors`, DSpark draft model) | Works in the Python API as a draft model (`architecture/inkling2_dspark.py`). Greedy, 300 tokens, low reasoning effort: 146 T/s against 72 for code, 96 against 72 for a list, 78 against 72 for prose, 32 against 69 for a 66-token answer. 17–47% of the drafts are accepted. Not quantized. Not set up in TabbyAPI. |
 | Vision | Not implemented. |
 | Tensor parallelism | Not supported. |
 
@@ -347,7 +347,7 @@ The checks in `util/inkling2/` compare the port with the transformers reference 
 
 #### TODO
 
-1. **MTP head.** Load `mtp.safetensors`, read the hidden states of layer applications 5, 23, 41 and 48 (also in the graph), run the 3-layer draft block and its Markov head, and send the 7 drafted tokens through the multi-token graph step.
+1. **MTP draft model: make it pay off everywhere.** It always drafts 7 tokens, and a rejected draft costs a wide verification pass (30 ms against 14.5 ms). Add a confidence cut (the draft softmax probability) so the block is cut or skipped when the drafter is unsure; put the draft block and the Markov chain in a CUDA graph; move the two windowed draft layers out of the paged cache; set it up in TabbyAPI (`util/inkling2/make_dspark_dir.py` makes the model directory).
 2. **Prefill attention.** A kernel that uses tensor cores for the global layers. A scalar kernel was tested and was 3 to 5 times slower than cuBLAS.
 3. **Decode.** Tune the block attention residual and gate kernels, and replace the remaining small PyTorch operations. The expert kernel (approximately 4.4 ms of 14 ms for each token) and memory bandwidth set the limit after that.
 4. **Graph steps wider than 8 tokens**, for the n-gram draft verification of tabbyAPI (65 tokens).
