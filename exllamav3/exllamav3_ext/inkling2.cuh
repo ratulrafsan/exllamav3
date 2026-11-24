@@ -111,3 +111,32 @@ void i2_attn_one
     int64_t capacity,
     float scale
 );
+
+// Prefill attention (many queries of one sequence), in three steps that keep fp32 accuracy while the matrix
+// products run on fp16 inputs (tensor cores, half the memory traffic of the fp32 forms):
+//
+//   i2_attn_qk    raw logits: q half [Hk, R, dh] (the R = G * nq query rows that share a K/V head), k half
+//                 [M, Hk, dh] as stored (read in place), sc float [Hk, R, M]. fp16 inputs, fp32 accumulation
+//   i2_attn_soft  per logit row: scale, relative bias, causal / window mask, and the exponentials relative to the
+//                 row maximum (the sink logit included in the maximum). Row (h, i) of sc [H, nq, kl] is query
+//                 position a0 + i against key positions j0 .. j0 + kl - 1. bias: float [nq, H, extent], indexed by
+//                 distance; window 0 = no window. Writes e * 2^14 split into two fp16 terms, p half [Hk, 2, G, nq,
+//                 kl] (term 0 the rounded value, term 1 the rounding remainder * 2^11), and den float [H, nq] =
+//                 sum of the row's exponentials + the sink's
+//   i2_attn_pv    weighted values: p half [Hk, R2, M], v half [M, Hk, dh] as stored, o float [Hk, R2, dh]
+//
+// attention output = (o[term 0] + o[term 1] * 2^-11) * 2^-14 / den
+void i2_attn_qk(const at::Tensor& q, const at::Tensor& k, at::Tensor sc);
+void i2_attn_soft
+(
+    const at::Tensor& sc,
+    const at::Tensor& bias,
+    const at::Tensor& sinks,
+    at::Tensor p,
+    at::Tensor den,
+    int64_t a0,
+    int64_t j0,
+    int64_t window,
+    float scale
+);
+void i2_attn_pv(const at::Tensor& p, const at::Tensor& v, at::Tensor o);

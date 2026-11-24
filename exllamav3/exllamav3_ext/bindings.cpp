@@ -258,6 +258,9 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
     m.def("i2_message_gate", &i2_message_gate, "i2_message_gate");
     m.def("i2_attn_one", &i2_attn_one, "i2_attn_one");
     m.def("i2_qkv_post", &i2_qkv_post, "i2_qkv_post");
+    m.def("i2_attn_qk", &i2_attn_qk, "i2_attn_qk");
+    m.def("i2_attn_soft", &i2_attn_soft, "i2_attn_soft");
+    m.def("i2_attn_pv", &i2_attn_pv, "i2_attn_pv");
 
 
     m.def("gated_delta_net_fused_op", &gated_delta_net_fused_op, "gated_delta_net_fused_op");

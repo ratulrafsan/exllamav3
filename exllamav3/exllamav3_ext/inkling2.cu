@@ -720,3 +720,175 @@ void i2_qkv_post
         Hk, dh, dr, local, base, qk_clip, rel_clip, log_alpha, log_n_floor, eps);
     cuda_check(cudaPeekAtLastError());
 }
+
+
+// ---------------------------------------------------------------------------------------------------------------
+// Prefill attention: fp16-input products with fp32 accumulation, and the row softmax between them
+
+#include "cublas_handle.cuh"
+
+// K/V stores are [M, Hk, dh]: head hk of it is a column-major [dh x M] matrix with leading dimension Hk * dh, and
+// the heads are a strided batch with stride dh
+void i2_attn_qk(const at::Tensor& q, const at::Tensor& k, at::Tensor sc)
+{
+    const at::cuda::OptionalCUDAGuard device_guard(q.device());
+    cudaStream_t stream = at::cuda::getCurrentCUDAStream().stream();
+    TORCH_CHECK(q.dim() == 3 && k.dim() == 3 && sc.dim() == 3, "i2_attn_qk: dims");
+    const int Hk = (int) q.size(0), R = (int) q.size(1), dh = (int) q.size(2), M = (int) k.size(0);
+    TORCH_CHECK(q.scalar_type() == at::kHalf && k.scalar_type() == at::kHalf && sc.scalar_type() == at::kFloat, "i2_attn_qk: dtypes");
+    TORCH_CHECK(k.size(1) == Hk && k.size(2) == dh && sc.size(0) == Hk && sc.size(1) == R && sc.size(2) == M, "i2_attn_qk: shapes");
+    TORCH_CHECK(q.is_contiguous() && k.is_contiguous() && sc.is_contiguous(), "i2_attn_qk: contiguity");
+    if (!R || !M) return;
+    cublasHandle_t handle = exl3_cublas_handle(stream);
+    const float alpha = 1.0f, beta = 0.0f;
+    // Column-major: C' [M x R] = op(K') [M x dh] * Q' [dh x R], K' stored [dh x M]
+    for (int h = 0; h < Hk; ++h)
+    {
+        auto r = cublasGemmEx(
+            handle, CUBLAS_OP_T, CUBLAS_OP_N, M, R, dh,
+            &alpha, (const half*) k.data_ptr() + (size_t) h * dh, CUDA_R_16F, Hk * dh,
+                    (const half*) q.data_ptr() + (size_t) h * R * dh, CUDA_R_16F, dh,
+            &beta,  (float*) sc.data_ptr() + (size_t) h * R * M, CUDA_R_32F, M,
+            CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP);
+        cublas_check(r);
+    }
+    cuda_check(cudaPeekAtLastError());
+}
+
+void i2_attn_pv(const at::Tensor& p, const at::Tensor& v, at::Tensor o)
+{
+    const at::cuda::OptionalCUDAGuard device_guard(p.device());
+    cudaStream_t stream = at::cuda::getCurrentCUDAStream().stream();
+    TORCH_CHECK(p.dim() == 3 && v.dim() == 3 && o.dim() == 3, "i2_attn_pv: dims");
+    const int Hk = (int) p.size(0), R = (int) p.size(1), M = (int) p.size(2), dh = (int) v.size(2);
+    TORCH_CHECK(p.scalar_type() == at::kHalf && v.scalar_type() == at::kHalf && o.scalar_type() == at::kFloat, "i2_attn_pv: dtypes");
+    TORCH_CHECK(v.size(0) == M && v.size(1) == Hk && o.size(0) == Hk && o.size(1) == R && o.size(2) == dh, "i2_attn_pv: shapes");
+    TORCH_CHECK(p.is_contiguous() && v.is_contiguous() && o.is_contiguous(), "i2_attn_pv: contiguity");
+    if (!R || !M) return;
+    cublasHandle_t handle = exl3_cublas_handle(stream);
+    const float alpha = 1.0f, beta = 0.0f;
+    // Column-major: O' [dh x R] = V' [dh x M] * P' [M x R]
+    for (int h = 0; h < Hk; ++h)
+    {
+        auto r = cublasGemmEx(
+            handle, CUBLAS_OP_N, CUBLAS_OP_N, dh, R, M,
+            &alpha, (const half*) v.data_ptr() + (size_t) h * dh, CUDA_R_16F, Hk * dh,
+                    (const half*) p.data_ptr() + (size_t) h * R * M, CUDA_R_16F, M,
+            &beta,  (float*) o.data_ptr() + (size_t) h * R * dh, CUDA_R_32F, dh,
+            CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP);
+        cublas_check(r);
+    }
+    cuda_check(cudaPeekAtLastError());
+}
+
+#define I2S_THREADS 256
+
+__launch_bounds__(I2S_THREADS)
+__global__ void i2_attn_soft_kernel
+(
+    const float* __restrict__ sc,
+    const float* __restrict__ bias,
+    const float* __restrict__ sinks,
+    half* __restrict__ p,
+    float* __restrict__ den,
+    const int H,
+    const int G,
+    const int nq,
+    const int kl,
+    const int extent,
+    const int64_t a0,
+    const int64_t j0,
+    const int window,
+    const float scale
+)
+{
+    __shared__ float red[I2S_THREADS];
+    __shared__ float mx;
+    const int i = blockIdx.x, h = blockIdx.y, t = threadIdx.x;
+    const float* row = sc + ((size_t) h * nq + i) * kl;
+    const float* b = bias + ((size_t) i * H + h) * extent;
+    const int hk = h / G, g = h % G;
+    half* hi = p + ((size_t) ((hk * 2 + 0) * G + g) * nq + i) * kl;
+    half* lo = p + ((size_t) ((hk * 2 + 1) * G + g) * nq + i) * kl;
+    // Visible keys: distance d = qd - j in [0, window)
+    const int64_t qd = a0 + i - j0;
+    const int jhi = (int) (qd < kl - 1 ? qd : kl - 1);
+    const int jlo = window > 0 && qd - window + 1 > 0 ? (int) (qd - window + 1) : 0;
+    const float sink = sinks[(size_t) i * H + h];
+
+    float m = -INFINITY;
+    for (int j = jlo + t; j <= jhi; j += I2S_THREADS)
+    {
+        const int64_t d = qd - j;
+        const float val = row[j] * scale + (d < extent ? b[d] : 0.0f);
+        m = fmaxf(m, val);
+    }
+    red[t] = m;
+    __syncthreads();
+    for (int s = I2S_THREADS / 2; s > 0; s >>= 1)
+    {
+        if (t < s) red[t] = fmaxf(red[t], red[t + s]);
+        __syncthreads();
+    }
+    if (t == 0) mx = fmaxf(red[0], sink);
+    __syncthreads();
+    const float top = mx;
+
+    float sum = 0.0f;
+    for (int j = t; j < kl; j += I2S_THREADS)
+    {
+        if (j < jlo || j > jhi)
+        {
+            hi[j] = __float2half_rn(0.0f); lo[j] = __float2half_rn(0.0f);
+            continue;
+        }
+        const int64_t d = qd - j;
+        const float val = row[j] * scale + (d < extent ? b[d] : 0.0f);
+        const float e = expf(val - top);
+        sum += e;
+        const float e14 = e * 16384.0f;
+        const half eh = __float2half_rn(e14);
+        hi[j] = eh;
+        lo[j] = __float2half_rn((e14 - __half2float(eh)) * 2048.0f);
+    }
+    red[t] = sum;
+    __syncthreads();
+    for (int s = I2S_THREADS / 2; s > 0; s >>= 1)
+    {
+        if (t < s) red[t] += red[t + s];
+        __syncthreads();
+    }
+    if (t == 0) den[(size_t) h * nq + i] = red[0] + expf(sink - top);
+}
+
+void i2_attn_soft
+(
+    const at::Tensor& sc,
+    const at::Tensor& bias,
+    const at::Tensor& sinks,
+    at::Tensor p,
+    at::Tensor den,
+    int64_t a0,
+    int64_t j0,
+    int64_t window,
+    float scale
+)
+{
+    const at::cuda::OptionalCUDAGuard device_guard(sc.device());
+    cudaStream_t stream = at::cuda::getCurrentCUDAStream().stream();
+    TORCH_CHECK(sc.dim() == 3 && sc.scalar_type() == at::kFloat && sc.is_contiguous(), "i2_attn_soft: sc must be float [H, nq, kl]");
+    const int H = (int) sc.size(0), nq = (int) sc.size(1), kl = (int) sc.size(2);
+    TORCH_CHECK(bias.dim() == 3 && bias.size(0) == nq && bias.size(1) == H && bias.scalar_type() == at::kFloat && bias.is_contiguous(), "i2_attn_soft: bias");
+    const int extent = (int) bias.size(2);
+    TORCH_CHECK(sinks.numel() == (int64_t) nq * H && sinks.scalar_type() == at::kFloat && sinks.is_contiguous(), "i2_attn_soft: sinks");
+    TORCH_CHECK(p.dim() == 5 && p.scalar_type() == at::kHalf && p.is_contiguous() && p.size(1) == 2, "i2_attn_soft: p must be half [Hk, 2, G, nq, kl]");
+    const int Hk = (int) p.size(0), G = (int) p.size(2);
+    TORCH_CHECK(Hk * G == H && p.size(3) == nq && p.size(4) == kl, "i2_attn_soft: p shape");
+    TORCH_CHECK(den.numel() == (int64_t) H * nq && den.scalar_type() == at::kFloat && den.is_contiguous(), "i2_attn_soft: den");
+    TORCH_CHECK(a0 >= j0, "i2_attn_soft: positions");
+    if (!nq || !kl) return;
+    i2_attn_soft_kernel<<<dim3(nq, H), I2S_THREADS, 0, stream>>>(
+        (const float*) sc.data_ptr(), (const float*) bias.data_ptr(), (const float*) sinks.data_ptr(),
+        (half*) p.data_ptr(), (float*) den.data_ptr(), H, G, nq, kl, extent, a0, j0, (int) window, scale);
+    cuda_check(cudaPeekAtLastError());
+}

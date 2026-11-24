@@ -357,6 +357,10 @@ def attention_core(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, rel: torch
         o = torch.bmm(sc.view(Hk, G, kl), v[j0:a1].float().permute(1, 0, 2))
         return o.view(1, H, dh)
 
+    ext = _prefill_ext()
+    if ext is not None and q.dtype == torch.half and k.dtype == torch.half and v.dtype == torch.half:
+        return _attention_core_h(ext, q, k, v, relf, sinkf, projf, window, extent, scale, max_elems, q_off)
+
     # Many queries (prefill). The work is passes over the logits [H, queries, keys], so:
     #   - sliding layers take the queries in chunks of ATTN_WINDOW_CHUNK: a chunk of c queries needs c + window - 1
     #     keys, and with large chunks most of those logits are masked
@@ -415,6 +419,66 @@ def attention_core(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, rel: torch
         o = o.view(H, nq, dh) / (1.0 + torch.exp(sinkf[i0:i1].t().unsqueeze(-1) - lse))
         out[i0:i1] = o.view(Hk, G, nq, dh).permute(2, 0, 1, 3).reshape(nq, H, dh)
         del o
+    return out
+
+
+_prefill_ext_mod = False
+
+
+def _prefill_ext():
+    """The extension when it has the prefill attention kernels (EXL3_I2_PREFILL_KERNEL=0 turns them off), else None"""
+    global _prefill_ext_mod
+    if _prefill_ext_mod is False:
+        _prefill_ext_mod = None
+        if os.environ.get("EXL3_I2_PREFILL_KERNEL", "1") != "0":
+            try:
+                from ..ext import exllamav3_ext as ext
+                if hasattr(ext, "i2_attn_soft"):
+                    _prefill_ext_mod = ext
+            except Exception:
+                pass
+    return _prefill_ext_mod
+
+
+def _attention_core_h(ext, q, k, v, relf, sinkf, projf, window, extent, scale, max_elems, q_off):
+    """
+    attention_core for many queries with fp16 Q, K and V (the stored form), through the extension:
+
+      * both matrix products take the fp16 values as they are and accumulate in fp32 (cuBLAS, tensor cores). The
+        products of fp16 values are exact in fp32, so the logits are those of the fp32 product. K and V are read in
+        place: no fp32 copies
+      * one kernel per chunk of queries does scale, bias, masks and the exponentials in two passes over the logits
+        (the PyTorch form needs about seven)
+      * the attention weights go into the second product as two fp16 terms (the rounded value and the rounding
+        remainder), which keeps about 22 bits of each weight
+    """
+    S, H, dh = q.shape
+    M, Hk = k.shape[0], k.shape[1]
+    G = H // Hk
+    assert projf.shape[1] == extent
+    out = torch.empty((S, H, dh), dtype = torch.float32, device = q.device)
+    k, v = k.contiguous(), v.contiguous()
+    kv_max = M if window is None else min(M, ATTN_WINDOW_CHUNK + window)
+    qc = max(16, min(2048 if window is None else ATTN_WINDOW_CHUNK, (max_elems // (H * max(kv_max, 1))) // 16 * 16))
+    for i0 in range(0, S, qc):
+        i1 = min(S, i0 + qc)
+        a0, a1 = q_off + i0, q_off + i1
+        j0 = 0 if window is None else max(0, a0 - window + 1)
+        nq, kl = i1 - i0, a1 - j0
+        qg = q[i0:i1].reshape(nq, Hk, G, dh).permute(1, 2, 0, 3).reshape(Hk, G * nq, dh).contiguous()
+        sc = torch.empty((Hk, G * nq, kl), dtype = torch.float32, device = q.device)
+        ext.i2_attn_qk(qg, k[j0:a1], sc)
+        bias = torch.matmul(relf[i0:i1], projf).contiguous()                       # [nq, H, extent]
+        p = torch.empty((Hk, 2, G, nq, kl), dtype = torch.half, device = q.device)
+        den = torch.empty((H, nq), dtype = torch.float32, device = q.device)
+        ext.i2_attn_soft(sc.view(H, nq, kl), bias, sinkf[i0:i1].contiguous(), p, den, a0, j0, window or 0, scale)
+        del sc, bias
+        o = torch.empty((Hk, 2 * G * nq, dh), dtype = torch.float32, device = q.device)
+        ext.i2_attn_pv(p.view(Hk, 2 * G * nq, kl), v[j0:a1], o)
+        del p
+        o = o.view(Hk, 2, G, nq, dh)
+        o = (o[:, 0] + o[:, 1] * 2.0 ** -11) * (2.0 ** -14 / den.view(Hk, G, nq, 1))
+        out[i0:i1] = o.permute(2, 0, 1, 3).reshape(nq, H, dh)
     return out
 
 
