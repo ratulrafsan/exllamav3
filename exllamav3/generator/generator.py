@@ -437,6 +437,10 @@ class Generator:
         self.recurrent_checkpoint_interval_pp = recurrent_checkpoint_interval_pp
         self.rolling_checkpoint = rolling_checkpoint and self.recurrent_cache is not None
 
+        # Local patch: a model can opt out of the prefill pipeline (caps["pipelined_prefill"] = False)
+        if not model.caps.get("pipelined_prefill", True):
+            pipelined_prefill = False
+
         # One pipeline per model: a retired generator may not have been closed
         previous = getattr(self.model, "pipeline", None)
         if previous is not None:

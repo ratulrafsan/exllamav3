@@ -1096,6 +1096,12 @@ class Inkling2LoopModel(Model):
             "recurrent_states": True,
             # A checkpoint holds the attention window of every sliding layer application (about 170 MB)
             "default_recurrent_checkpoint_interval": 4096,
+            # No pipelined prefill unless asked for (EXL3_I2_PIPELINED_PREFILL=1). The generator's pipeline runs the
+            # GPUs of a straight split at the same time, one chunk behind the other; everything else here runs
+            # them in turn. On the development machine (RTX 4090 + 3090) the first chunk that had both GPUs
+            # under full load power-cycled the computer, three times out of three (2026-11-24), and the path is
+            # not validated against the sequential one for this model
+            "pipelined_prefill": os.environ.get("EXL3_I2_PIPELINED_PREFILL", "0") == "1",
         })
         self.recurrent_state_cls = Inkling2State
         self._graphs = {}               # tokens per step -> _DecodeGraph
