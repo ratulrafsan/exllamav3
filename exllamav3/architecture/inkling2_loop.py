@@ -1,6 +1,7 @@
 from __future__ import annotations
 from typing_extensions import override
 import os
+import weakref
 import torch
 
 from ..model.config import Config
@@ -431,10 +432,26 @@ class Inkling2LoopConfig(Config):
         assert self.layer_map is None and self.layer_map_str is None, \
             "Inkling2Loop defines its own layer map (the loop passes); layer_map cannot be combined with it"
         self.layer_map = [layer for layer, _ in c.applications]
+        # Position of (layer, pass) in the forward order: the "visit" numbers a drafter's taps count
+        self.app_index = {lp: n for n, lp in enumerate(c.applications)}
 
     @override
     def default_max_position_embeddings(self):
         return 1048576
+
+
+def _wants_tap(params: dict, visit: int) -> bool:
+    """Whether a draft model asked for the hidden state at this layer application (params["export_state_layers"])"""
+    want = params.get("export_state_layers")
+    return bool(want) and visit in want
+
+
+def _export_tap(params: dict, t: torch.Tensor):
+    """Append a tapped state [bsz, seq, hidden] to params["export_states"] (in forward order)"""
+    states = params.get("export_states")
+    if states is None:
+        states = params["export_states"] = []
+    states.append(t)
 
 
 class _RowState:
@@ -640,11 +657,15 @@ class _DecodeGraph:
     between the replays.
     """
 
-    def __init__(self, model: "Inkling2LoopModel", cache, slot: int, base_page: int, cap: int, width: int = 1):
+    def __init__(self, model: "Inkling2LoopModel", cache, slot: int, base_page: int, cap: int, width: int = 1,
+                 taps: frozenset = frozenset()):
         # base_page < 0: the sequence's pages are not contiguous; the global layers gather them
         # width: tokens per step (1 when decoding, more for a pass that verifies drafted tokens)
-        self.key = (id(cache), slot, base_page, cap, width)
+        # taps: layer applications whose input a draft model reads (see _wants_tap)
+        self.key = (id(cache), slot, base_page, cap, width, taps)
         self.width = width
+        self.taps = taps
+        self.exports = []
         cfg = model.config.i2
         apps = [(m, inst) for m, inst, _ in model.fwd_modules]
         self.segments = []
@@ -680,6 +701,8 @@ class _DecodeGraph:
     def _run(self, capture: bool):
         row = _RowState()
         params = {"cache": self.cache, "i2": [row], "i2_graph": self.g}
+        if self.taps:
+            params["export_state_layers"] = self.taps
         x = self.ids
         for seg in self.segments:
             dev = seg["device"]
@@ -726,6 +749,8 @@ class _DecodeGraph:
                         x = body(x)
             else:
                 x = body(x)
+        if capture:
+            self.exports = params.get("export_states") or []
         return x
 
     def build(self):
@@ -887,6 +912,9 @@ class Inkling2Layer(_I2Module):
                 g["base"], g["cap"], g["consts"][self.device],
             )
             msgs = st.loop.enter(cfg, self.W, x[0], st.blocks, loop_pass, view.kops)
+            if _wants_tap(params, self.config.app_index[key]):
+                # A copy: the tensor has to stay valid as an output of the graph
+                _export_tap(params, st.loop.hidden.unsqueeze(0).clone())
             h, st.blocks = I2.layer_forward(self.W, self.ex, st.loop.hidden, st.loop.blocks, adt, view, ctl[0], msgs)
             st.loop.hidden = st.loop.blocks = None
             st.loop.leave(cfg, self.W, loop_pass)
@@ -908,6 +936,8 @@ class Inkling2Layer(_I2Module):
             n = x.shape[1]
         if self.mlp is not None:
             self.ex.params = params
+        tap = _wants_tap(params, self.config.app_index[(self.layer_idx, loop_pass)])
+        taps = []
         for b, st in enumerate(params["i2"]):
             st.to(self.device)
             view = None
@@ -920,11 +950,24 @@ class Inkling2Layer(_I2Module):
                 # the forward (SWAState.post_advance)
                 rs.wshift = ring_shift(cache_pos, n, self.kv_state_size)
             msgs = st.loop.enter(cfg, self.W, x[b], st.blocks, loop_pass)
+            if tap:
+                taps.append(st.loop.hidden)
             out[b], st.blocks = I2.layer_forward(
                 self.W, self.ex, st.loop.hidden, st.loop.blocks, adt, view, pos0, msgs
             )
             st.loop.hidden = st.loop.blocks = None
             st.loop.leave(cfg, self.W, loop_pass)
+        if tap:
+            _export_tap(params, torch.stack(taps))
+        if params.get("prefill") and _wants_tap(params, len(cfg.applications)):
+            # A prefill stops after the last layer, without the head; a draft model's tap of the final normed
+            # hidden state is made here
+            head = self.head_ref()
+            finals = []
+            for b, st in enumerate(params["i2"]):
+                st.to(head.device)
+                finals.append(I2.final_hidden(head.Hd, out[b].to(head.device), st.blocks, adt))
+            _export_tap(params, torch.stack(finals))
         return out
 
 
@@ -948,13 +991,18 @@ class Inkling2Head(_I2Module):
     def forward(self, x: torch.Tensor, params: dict, out_dtype: torch.dtype | None = None) -> torch.Tensor:
         adt = self.config.activation_dtype
         n = x.shape[1]
-        out = []
+        out, finals = [], []
         for b, st in enumerate(params["i2"]):
             if "i2_graph" not in params:
                 st.to(self.device)
             # The forward loop may have cut the hidden state to the last tokens (last_tokens_only)
             blocks = st.blocks[:, -n:]
-            out.append(I2.logits_from_hidden(self.Hd, I2.final_hidden(self.Hd, x[b], blocks, adt)))
+            fin = I2.final_hidden(self.Hd, x[b], blocks, adt)
+            finals.append(fin)
+            out.append(I2.logits_from_hidden(self.Hd, fin))
+        if _wants_tap(params, len(self.config.i2.applications)):
+            # The final normed hidden state: the tap after the last layer application
+            _export_tap(params, torch.stack(finals).clone())
         if "i2_graph" not in params:
             del params["i2"]
         return out[0].unsqueeze(0) if len(out) == 1 else torch.stack(out)
@@ -972,6 +1020,9 @@ class Inkling2LoopModel(Model):
         self.last_kv_module_idx = len(self.modules) - 1
         self.modules += [Inkling2Head(config)]
         self.logit_layer_idx = len(self.modules) - 1
+        self.embed, self.head = self.modules[0], self.modules[-1]
+        for m in self.modules[1:-1]:
+            m.head_ref = weakref.ref(self.head)
 
         self.caps.update({
             "supports_tp": False,
@@ -1062,7 +1113,8 @@ class Inkling2LoopModel(Model):
             cache_pos -= shift
         rs.wshift = shift
 
-        key = (id(cache), rs.slot, base_page, cap, width)
+        taps = frozenset(params.get("export_state_layers") or ())
+        key = (id(cache), rs.slot, base_page, cap, width, taps)
         try:
             graph = self._graphs.get(width)
             if graph is None or graph.key != key:
@@ -1073,13 +1125,15 @@ class Inkling2LoopModel(Model):
                 # One graph per width; beyond a few widths the least recently built one goes
                 while len(self._graphs) >= _GRAPH_MAX_GRAPHS:
                     self._graphs.pop(next(w for w in self._graphs if w != 1) if any(w != 1 for w in self._graphs) else next(iter(self._graphs)))
-                graph = _DecodeGraph(self, cache, rs.slot, base_page, cap, width)
+                graph = _DecodeGraph(self, cache, rs.slot, base_page, cap, width, taps)
                 graph.set_inputs(input_ids, position, cache_pos, gather)
                 graph.build()
                 self._graphs[width] = graph
             graph.set_inputs(input_ids, position, cache_pos, gather)
             self.graph_steps += 1
             y = graph.step()
+            if graph.exports:
+                params["export_states"] = [t.clone() for t in graph.exports]
             num = params.get("last_tokens_only")
             return y[:, -num:].contiguous() if num else y
         except Exception as e:

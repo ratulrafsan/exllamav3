@@ -30,6 +30,7 @@ from .hcxvisionv2 import HCXVisionV2Model
 from .hy_v3 import HyV3Model
 from .hyperclovax import HyperClovaxModel
 from .inkling2_loop import Inkling2LoopModel
+from .inkling2_dspark import Inkling2DSparkModel
 from .iquestcoder import IQuestCoderModel
 from .kimi_linear import KimiLinearModel
 from .bailing_hybrid import BailingHybridModel
@@ -111,6 +112,7 @@ ARCHITECTURES = {
         HyV3Model,
         HyperClovaxModel,
         Inkling2LoopModel,
+        Inkling2DSparkModel,
         IQuestCoderModel,
         LagunaModel,
         Lfm2Model,
