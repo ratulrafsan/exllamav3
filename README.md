@@ -52,7 +52,7 @@ The settings for this system are in the TabbyAPI configuration and start script.
 | Pipelined prefill with CPU experts | Lets the two GPUs work on different prefill chunks when the CPU expert split is on. This is a port of [a commit by Auryn Macmillan](https://github.com/auryn-macmillan/exllamav3/commit/b38de78bd0376fcdc4f92344ed405800ac8374b6). The port also adds a lock to the n-gram row table. Prefill of prompts longer than one chunk is approximately 10% faster. `EXL3_PIPELINED_PREFILL=0` turns it off. |
 | Late promote hook | Moves the promote-on-miss step off the critical path of decode and makes its budget a setting. Decode is approximately 17% faster on this system. Refer to [Late promote hook](#late-promote-hook). |
 | Expert lookahead (experimental, off by default) | Predicts the experts of the next split layer and copies them from RAM to VRAM before the layer needs them. It needs a source build of the extension. On this system it makes decode slower. Refer to [Expert lookahead](#expert-lookahead). |
-| Inkling-2-Mini (work in progress) | Adds the looped Inkling-2 text model: load from the source checkpoint or from an EXL3 conversion of its experts, cache, generator, CUDA-graph decode and decode kernels. It needs a source build of the extension for full speed. Refer to [Inkling-2-Mini](#inkling-2-mini). |
+| Inkling-2-Mini (work in progress) | Adds the looped Inkling-2 model (text and image input): load from the source checkpoint or from an EXL3 conversion of its experts, cache, generator, CUDA-graph decode and decode kernels. It needs a source build of the extension for full speed. Refer to [Inkling-2-Mini](#inkling-2-mini). |
 
 ### Late promote hook
 
@@ -242,7 +242,7 @@ The layer math and the NVFP4 / MXFP8 dequantizers are adapted from [0xSero/inkli
 | Multi-token graph steps (verify drafted tokens) | Works for a maximum of 8 tokens in one forward pass. The MTP draft model uses them. |
 | Prefill | Attention and the block attention residual run through the extension (cuBLAS products on fp16 inputs with fp32 accumulation, own kernels). The rest is plain PyTorch. The pipelined prefill of the generator is off for this model. Refer to [Limits](#limits). |
 | MTP head (`mtp.safetensors`, DSpark draft model) | Works as a draft model (`architecture/inkling2_dspark.py`), in the Python API and in TabbyAPI (`draft_mode: model`, `draft_num_tokens: 7`, `dynamic_draft: true`; the model directory comes from `util/inkling2/make_dspark_dir.py`). Refer to the TabbyAPI results below. Not quantized. |
-| Vision | Not implemented. |
+| Vision | Works: the vision tower is the `vision` component of the model (`architecture/inkling2_vision.py`), in the Python API and in TabbyAPI (`vision: true`, with the TabbyAPI patch below). Refer to [Images](#images). |
 | Tensor parallelism | Not supported. |
 
 #### Requirements
@@ -300,6 +300,9 @@ Quality against the source checkpoint over 20,480 tokens (`util/inkling2/quality
 | `EXL3_I2_MOE` | `dense` runs the EXL3 experts in a slow reference loop. Use it to compare with `kernel`. | `kernel` |
 | `EXL3_I2_ADT` | The activation data type: `fp16`, `bf16` or `fp32`. The decode kernels need `fp16`. | `fp16` |
 | `EXL3_I2_NAN_CHECK` | `1` shows a line when a forward pass gives logits that are not finite. | `0` |
+| `EXL3_I2_VISION_DEVICE` | Where the vision tower loads: `last` (the last GPU), `first` (the device the loader gives it), `cpu` or `cuda:N`. | `last` |
+| `EXL3_I2_VISION_FP16_PATCHES` | Images with more patches than this run the tower's attention in fp16. | `12000` |
+| `EXL3_I2_DSPARK_WINDOW` | Limits the context of the drafter's full-attention layer to this number of tokens. `0` is all of it. Refer to the drafter results before you set it. | `0` |
 
 #### Test results
 
@@ -309,20 +312,22 @@ Decode (`util/inkling2/graph_check.py`):
 
 | Context (tokens) | Operation by operation | CUDA graph with kernels |
 |---|---|---|
-| 600 | 26 T/s | 90 T/s |
-| 2,000 | 26 T/s | 89 T/s |
-| 9,000 | 26 T/s | 86 T/s |
-| 30,000 | 26 T/s | 78 T/s |
-| 45,000 | 26 T/s | 74 T/s |
+| 600 | 26 T/s | 91 T/s |
+| 2,000 | 26 T/s | 90 T/s |
+| 9,000 | 26 T/s | 88 T/s |
+| 30,000 | 26 T/s | 81 T/s |
+| 45,000 | 26 T/s | 77 T/s |
 
 Forward passes with more than one token of one sequence (`util/inkling2/graph_spec_check.py`):
 
 | Tokens | Operation by operation | Graph |
 |---|---|---|
-| 1 | 39.2 ms | 11.4 ms |
-| 2 | 47.2 ms | 15.0 ms |
-| 4 | 47.6 ms | 18.7 ms |
-| 8 | 48.5 ms | 24.7 ms |
+| 1 | 39.3 ms | 11.2 ms |
+| 2 | 47.1 ms | 14.7 ms |
+| 4 | 47.2 ms | 18.1 ms |
+| 8 | 48.1 ms | 23.3 ms |
+
+At 45K tokens of context a pass of 8 tokens takes 31.8 ms and a pass of one token 13.5 ms: the attention kernel reads K and V once for all tokens of a pass.
 
 Prefill, one chunk of 2,048 tokens (`util/inkling2/component_bench.py`):
 
@@ -353,272 +358,53 @@ With the DSpark draft model (`dynamic_draft: true`, confidence 0.4, 400 tokens, 
 | Essay | 81.8 T/s |
 | After a 161,543-token prompt | 34.6 T/s (48 T/s without the draft model) |
 
-The draft model gains on text it predicts well and loses on free prose and at very long context. `util/inkling2/draft_trace.py` shows the cost of each round by draft length.
+The draft model gains on text it predicts well and loses on free prose and at very long context. `util/inkling2/draft_trace.py` shows the cost of each round by draft length. The numbers above are from before the attention kernel read K and V once for each pass; the script bench at 45K tokens of context now gives 98 T/s on code and 68 T/s on essay text against 74 T/s without the draft model.
 
-#### How the patch works
+A context window for the drafter (`EXL3_I2_DSPARK_WINDOW`) is not a gain. At 45K tokens of context it takes 0.2 ms off a 4.3 ms round. On a prompt that quotes text from far back, the drafter gives 102 T/s with its full context and 70.5 T/s with a window of 4,096 or 1,024 tokens.
 
-The patch changes `exllamav3/modules/block_sparse_mlp_cpu.py`.
+#### Images
 
-- `_split_swap_tick` counts the decode steps in the first split layer, as before. In late mode, it calls `_split_promote_step` from the last split layer of the text model that has spare slots.
-- The order of operations stays correct. A transfer goes on the promotion stream after all work that the compute stream has in its queue. This work includes the issue, the expert kernels and the collect of each earlier layer of the same step. The map update of a completed transfer goes on the compute stream before the selection translate of the last layer, and before the translate of all layers in the next step.
-- In late mode, the map updates go through pinned staging buffers. A copy from pageable host memory waits until the compute stream is empty. In the first test, this wait was approximately 15 ms for each step.
+The vision tower is a 23-layer vision transformer (303M parameters, 1.2 GiB in fp32). The image is not resized: it is padded to cells of 40 x 40 pixels, and each cell is one image token. An image of 1024 x 768 pixels is 520 tokens. An image with a side of more than 4,096 pixels (the limit of the model card) is scaled down first.
 
-#### Test results
-
-The test uses the hardware in [Hardware and constraints](#hardware-and-constraints), with TabbyAPI. Each run uses a new server and a saved expert placement. A run has 8 chat requests of 400 tokens on different topics, with greedy decode, thinking off, MTP and hybrid drafting. The decode speed is the mean of the 8 requests. The hit rate is the mean for the full run, and it includes the cold start.
-
-| Condition | Decode, each run (T/s) | Mean | Hit rate | Host time of the promote step |
-|---|---|---|---|---|
-| Stock: first layer, budget 6 | 64.9 / 64.1 / 63.7 / 63.2 / 63.3 | 63.8 | 62% | 2.1 ms |
-| First layer, budget 16 | 62.5 / 63.1 | 62.8 | 70% | 4.0 ms |
-| First layer, budget 33 | 62.6 / 61.6 | 62.1 | 75% | 5.4 ms |
-| Late, budget 6 | 68.9 / 67.6 | 68.2 | 63% | 2.6 ms |
-| Late, budget 16 | 72.9 / 73.2 | 73.0 | 70% | 5.3 ms |
-| Late, budget 33 | 75.6 / 73.8 / 74.6 | 74.7 | 75% | 7.1 ms |
-| Late, budget 33, ratio 1.2 | 75.5 / 75.4 | 75.5 | 76% | 7.5 ms |
-
-- Late mode with a budget of 33 is approximately 17% faster than stock.
-- A ratio of 1.2 gives no clear difference. The difference is smaller than the difference between two runs of one condition.
-- A test run with `EXL3_MOE_CPU_PROMOTE_VERIFY=1` compared 37,025 promotions and 37,011 demotions with the checkpoint. All were correct.
-
-#### Limits
-
-- The verify mode makes each transfer synchronous. Thus, it shows that the transferred data is correct, but it does not test the order of operations in late mode. No test covers that order.
-- The output quality is not graded. With a larger budget, more experts move between the CPU and the GPU during a generation. The same weights give slightly different results on the two devices.
-- `tests/moe_cpu/test_promote_step.py` was not run with this patch.
-- The patch is tested with one model, one workload and all split layers on one GPU.
-- The host time of the promote step increases with the budget. If the host time becomes longer than the time the GPU needs for the earlier layers, the GPU waits again.
-
-### Expert lookahead
-
-> [!WARNING]
-> **This patch is experimental, and it is off by default.** On the system in [Hardware and constraints](#hardware-and-constraints), it makes decode slower: 60 T/s with the patch and 75 T/s without it. The patch is in this branch because the result can be different on other hardware. It is not tested on other hardware.
-
-#### Overview
-
-With the CPU expert split, the CPU worker calculates each routed expert that is not in VRAM. The idea of this patch comes from [TokenWing](https://github.com/runmyai/tokenwing), which uses it to read experts from an SSD before a layer needs them. This patch uses the idea for the transfer from RAM to VRAM:
-
-1. While split layer L calculates, the router of layer L+1 runs on the router input of layer L. The result is a prediction of the experts that layer L+1 selects.
-2. A kernel selects the predicted experts that are in RAM and gives each one a free GPU slot.
-3. On a second CUDA stream, a kernel copies each of these experts from the pinned RAM arena to its GPU slot. A last kernel changes the placement map and writes the transfer to a log in pinned memory.
-4. Layer L+1 then finds these experts in VRAM. The experts stay in VRAM.
-5. The promote step of the host reads the log, and it moves less frequently used experts back to RAM to make free GPU slots.
-
-All transfers from RAM to VRAM go through these kernels when the patch is on. The promote step sends its own promotions to the kernels as requests. The host does not wait for the GPU in this procedure.
-
-#### Requirements
-
-- **A source build of the extension.** The patch adds CUDA kernels (`exllamav3/exllamav3_ext/cpu/moe_lookahead.cu`). The release wheels do not contain them. With a wheel, the setting has no effect, and the log shows `Expert lookahead: off (the extension has no moe_la_step ...)`.
-- The CPU expert split with the pinned arena (`EXL3_MOE_PINNED_ARENA=1`) and promote-on-miss.
-- All split layers on one GPU.
-- A router of the standard type, with no norm between the layer input and the router.
-
-To build the extension without a change to the installed package:
-
-```sh
-CUDA_HOME=/usr/local/cuda-13.0 python setup.py build_ext --build-lib ../exl3_build/lib --build-temp ../exl3_build/tmp
-PYTHONPATH=/path/to/exl3_build/lib:/path/to/this/checkout python main.py
-```
-
-#### Settings
-
-| Variable | Value | Default |
-|---|---|---|
-| `EXL3_MOE_CPU_LOOKAHEAD` | The maximum number of predicted experts that one split layer uploads for each decode step. `0` turns the patch off. | `0` (off) |
-| `EXL3_MOE_CPU_LOOKAHEAD_ROWS` | A forward pass with more rows than this value does not use predictions. | `4` |
-| `EXL3_MOE_CPU_LOOKAHEAD_BLOCKS` | The number of blocks of the upload kernel for each expert. `0` uses one block for each run of 8 tiles. This is the fastest upload. | `0` |
-| `EXL3_MOE_CPU_LOOKAHEAD_DRY` | `1` runs the predictor but uploads none of its experts. Use it to measure the cost of the predictor. | `0` |
-| `EXL3_MOE_CPU_PROMOTE` | The number of spare GPU slots for each split layer. This is a stock setting. The lookahead uses more free slots: the tests use `8` with a lookahead of 1 or 2, and `12` with a lookahead of 4. | `4` |
-
-When the patch is on, the log shows a line of this type:
+In the prompt, an image is a message of its own:
 
 ```
- -- Expert lookahead: on, 2 per layer per step, 32 of 33 split layers predicted
+<|message_user|><|content_image|>{image tokens}<|end_message|><|message_user|><|content_text|>What is in this image?<|end_message|>
 ```
 
-With `EXL3_MOE_CPU_SWAP_DEBUG=1`, the promote-on-miss line also shows the number of uploads for each step.
+Python API:
 
-#### Test results
+```python
+vision = Model.from_config(config, component = "vision")
+vision.load()
+image = vision.get_image_embeddings(tokenizer, PIL.Image.open("photo.png"))
+prompt = effort + "<|message_user|><|content_image|>" + image.text_alias + "<|end_message|>" + question
+text = generator.generate(prompt = prompt, embeddings = [image], encode_special_tokens = True, ...)
+```
 
-The test uses the hardware in [Hardware and constraints](#hardware-and-constraints), with TabbyAPI, the late promote hook and a budget of 33. All runs use the extension from a source build. A run has 8 chat requests of 400 tokens. Each run uses a new server.
+TabbyAPI concatenates the parts of a message into one text, which puts the image inside a text message. `patches/tabby_inkling2_format.patch` of the TabbyAPI checkout gives the parts to the chat template as a list when the vision model names an image placeholder (`image_placeholder`), and replaces each placeholder in the rendered prompt with the alias of an image.
 
-| Condition | Decode (T/s) | Hit rate |
-|---|---|---|
-| Lookahead off, 2 runs | 75.0 / 75.1 | 76% |
-| Kernel transfers, no predictions (`EXL3_MOE_CPU_LOOKAHEAD_ROWS=0`) | 68.7 | 74% |
-| Predictor on, no uploads of its experts (`EXL3_MOE_CPU_LOOKAHEAD_DRY=1`) | 67.3 | 75% |
-| Lookahead 1 | 63.4 | 80% |
-| Lookahead 2, 2 runs | 60.3 / 60.4 | 82% |
-| Lookahead 4 | 55.2 | 84% |
+Checks (`util/inkling2/vision_check.py` against `util/inkling2/ref_dump_vision.py`, three test images):
 
-- **The patch does its function.** With a lookahead of 2, the hit rate is 86% to 89% after the cold start. The CPU worker calculates 0.99 experts for each row of a split layer, and 1.78 without the patch.
-- **The data is correct.** A test run with `EXL3_MOE_CPU_PROMOTE_VERIFY=1` compared 108,452 promotions and 108,383 demotions with the checkpoint. All were correct.
-- **Decode is slower.** The input of each split layer comes approximately 0.29 ms later to the CPU worker (0.52 ms and not 0.23 ms). This is more than the time that the worker saves (0.15 ms and not 0.22 ms for each layer).
-- **The predictor is not the cause.** It costs approximately 2%.
-
-The cause is the upload kernel. It reads the experts from mapped host memory. The kernels of the CPU hand-off also use mapped host memory: one kernel writes the layer input to a pinned slot, and one kernel reads the result. While an upload runs, these kernels wait. A test without the model shows the same effect (`upload_interference_bench.py` in the benchmark files of this system, which are not part of this repository). Beside 200 uploads, a stream of small kernels that use pinned memory is 17.3 ms slower with uploads from mapped memory. It is 3.5 ms slower with uploads by `cudaMemcpyAsync`.
-
-A smaller upload kernel does not help. With fewer blocks, the upload is slower and the wait is longer: 58.5 T/s with 128 blocks, 45.3 T/s with 16 blocks and 19.2 T/s with 4 blocks.
-
-#### When the patch can help
-
-These are estimates. They are not tested.
-
-- **A slow CPU for the expert calculation.** On this system, one expert on the CPU costs approximately 57 µs. An upload must also move one other expert back to RAM. Thus, an upload must prevent approximately two CPU calculations to be useful. If one expert on the CPU costs much more, for example with fewer cores or without AVX2, the balance changes.
-- **More memory bandwidth.** The uploads and the CPU worker use the same RAM. This system has DDR4.
-- **A different upload path.** An upload by `cudaMemcpyAsync` does not make the hand-off kernels wait as much. It needs a host thread that reads the plan of the select kernel and starts the copies. This is not built. An estimate from the measured costs gives 70 to 77 T/s on this system, against 75 T/s without the patch.
-
-#### How the patch works
-
-- `exllamav3/exllamav3_ext/cpu/moe_lookahead.cu` has the select, upload, commit and host-update kernels. `exllamav3/modules/moe_lookahead.py` has the tables of pointers and the calls. `block_sparse_mlp_cpu.py` calls them from the submit of each split layer and from the promote step.
-- The placement map, the set of experts in transfer and the pool of free GPU slots are in device memory. Only kernels on the compute stream change them, in stream order. The one exception is the map update of a completed upload on the second stream.
-- That map update is safe at any time. Before it, no router ID points to the GPU slot. After it, the expert is still in its RAM slot until the host sees the log entry. The host then uses the RAM slot for a demotion, and it puts this demotion after all work of the compute stream.
-- A demoted expert gives its GPU slot back to the pool in the same kernel that changes its map entry. Thus, no kernel can read the slot when a new upload writes to it.
-- If the previous upload of a layer is not complete, the layer does not start a new one in that step.
-- Before a forward pass of prefill size, the host waits for all uploads.
-- For the lookahead, the arena is registered with the `MAPPED` flag, so that kernels can read it.
-
-#### Limits
-
-- The patch is tested with one model and one system only.
-- No unit test covers the patch. The verify mode makes the checks after a synchronization, so it does not test the order of operations.
-- The output quality is not graded. More experts move between the CPU and the GPU during a generation than without the patch.
-- The patch does not use a trained correction of the prediction. On a recorded session, a correction increased the part of the CPU experts that the prediction finds from 59% to 69%.
-
-### Inkling-2-Mini
-
-> [!WARNING]
-> This is work in progress. Text input only. The vision tower is not implemented. The draft model (the MTP head) works in the Python API and in TabbyAPI.
-
-#### Overview
-
-[Inkling-2-Mini](https://huggingface.co/thinkingmachines/Inkling-2-Mini) is a 26.4B-parameter MoE model from Thinking Machines. It is a looped transformer:
-
-- The model has 24 layers of weights. Layers 6 to 17 run three times for each token, so a token goes through 48 layer applications.
-- Passes 2 and 3 start again from the hidden state before the loop. They receive "messages" from the pass before, mixed in through small gates.
-- Attention has no RoPE. It uses a relative position bias computed from the hidden state, a sink logit for each token, and short convolutions on K, V and the layer outputs.
-- 20 layers use a sliding window of 1,024 tokens. 4 layers are global.
-- Each layer has 128 experts with 8 active for each token.
-
-This fork adds the architecture `Inkling2LoopForConditionalGeneration`. It is not in upstream exllamav3.
-
-The layer math and the NVFP4 / MXFP8 dequantizers are adapted from [0xSero/inkling2-exl3](https://github.com/0xSero/inkling2-exl3) (MIT), which supports the larger Inkling-2-Small without the loop. The design of the decode step (graph replay, split attention) follows the notes of [ashalliants/ninfer-3090](https://github.com/ashalliants/ninfer-3090) (Apache 2.0).
-
-#### Current state
-
-| Item | State |
+| Check | Result |
 |---|---|
-| Load from the source checkpoint (experts stay in NVFP4 / MXFP8) | Works. 17.6 GiB of VRAM. Slow: approximately 6 T/s. |
-| EXL3 conversion of the experts | Works. Refer to [Convert the model](#convert-the-model). |
-| Cache, generator, tabbyAPI | Works. Each loop pass has its own cache layers. FP16 cache only. |
-| Context length | Tested with a 161,543-token prompt on the RTX 4090 + RTX 3090, with and without the draft model. |
-| Decode as CUDA graph replays, with decode kernels | Works for one sequence with EXL3 experts. |
-| Multi-token graph steps (verify drafted tokens) | Works for a maximum of 8 tokens in one forward pass. The MTP draft model uses them. |
-| Prefill | Attention and the block attention residual run through the extension (cuBLAS products on fp16 inputs with fp32 accumulation, own kernels). The rest is plain PyTorch. The pipelined prefill of the generator is off for this model. Refer to [Limits](#limits). |
-| MTP head (`mtp.safetensors`, DSpark draft model) | Works as a draft model (`architecture/inkling2_dspark.py`), in the Python API and in TabbyAPI (`draft_mode: model`, `draft_num_tokens: 7`, `dynamic_draft: true`; the model directory comes from `util/inkling2/make_dspark_dir.py`). Refer to the TabbyAPI results below. Not quantized. |
-| Vision | Not implemented. |
-| Tensor parallelism | Not supported. |
+| Preprocessing against the reference image processor | Identical (maximum difference 1.2e-7) |
+| Tower output against the reference in fp32 | 1.5e-6 to 2.4e-6 relative error |
+| The reference in bf16 against the reference in fp32 | 1.7e-2 to 2.5e-2 |
+| Questions about test images (shapes and colours, text in an image, numbers at positions of a 3 x 4 board) | Correct, in the Python API and through TabbyAPI, with and without the draft model |
 
-#### Requirements
-
-- **A source build of the extension for full speed.** The patch adds CUDA kernels (`exllamav3/exllamav3_ext/inkling2.cu`) and the Inkling-2 activation in the expert kernels. The release wheels do not contain them. With a wheel, the model gives correct results on a slow path, and the log shows a line that starts with ` !! Inkling2:`.
-- **The native CUDA allocator.** CUDA graph capture does not work with `cudaMallocAsync`. In tabbyAPI, set `cuda_malloc_async: false`. With the async allocator the model decodes without graphs and shows a `!!` line.
-- **The FP16 cache.** Quantized cache modes are not supported.
-- **A GPU split with free memory.** Attention on the global layers needs working memory that grows with the context. On this system, tabbyAPI uses `autosplit_reserve: [2560, 1024]` with a cache of 163,840 tokens. The peak with a 161,543-token prompt is 21.1 GiB on the first GPU.
-- **The loop on one GPU.** Layers 6 to 17 run three times. If one of them is on a different GPU than the others, each pass crosses GPUs and decode is approximately 10% slower. The input embedding table stays in system RAM (0.9 GiB) to make room, and in tabbyAPI the draft model goes to the second GPU (`draft_gpu_split: [0, 8]`). `util/inkling2/graph_profile.py --cache <tokens> --chunk <chunk size>` shows the split and the graph segments.
-
-Build the extension with:
-
-```
-# in the root of this repository
-python setup.py build_ext --build-lib ../exl3_build/lib --build-temp ../exl3_build/tmp
-```
-
-Then put `exl3_build/lib` first on `PYTHONPATH`.
-
-#### Convert the model
-
-The source checkpoint has the experts only in NVFP4 (layers 0 to 19) and MXFP8 (layers 20 to 23). There is no full-precision release. The stock converter (`convert.py`) cannot run a looped model, so the conversion has its own script:
-
-```
-python util/inkling2/convert_exl3.py <source dir> <output dir> --work <work dir> --rows 250 --bits 6 --bits-mx 8
-```
-
-- The script quantizes the experts only (93% of the parameters). All other tensors stay as in the checkpoint.
-- The calibration pass collects the Hessians of each expert over all three loop passes. There is no error propagation between layers.
-- The conversion takes approximately 65 minutes on this system. The work directory needs approximately 60 GB. You can delete it after the conversion.
-- The result at 6 bpw (8 bpw for the MXFP8 layers) is 23 GB on disk and uses 21.2 GiB of VRAM.
-
-Quality against the source checkpoint over 20,480 tokens (`util/inkling2/quality_check.py`):
-
-| Model | KL | Top-1 agreement | Perplexity |
-|---|---|---|---|
-| Source checkpoint (reference) | - | - | 8.4444 |
-| Source checkpoint with bf16 activations (noise floor) | 0.00245 | 97.64% | 8.4478 |
-| EXL3, 6 bpw | 0.00282 | 97.49% | 8.4452 |
-
-> [!NOTE]
-> The top-k expert routing of this model is discontinuous. Two runs that differ only by rounding give logits that differ by 2 to 3%. The "noise floor" line shows this effect. Do not compare outputs token by token without it.
-
-#### Settings
-
-| Variable | Value | Default |
+| Image | Image tokens | Tower time (RTX 3090) |
 |---|---|---|
-| `EXL3_I2_GRAPH` | `0` runs each decode step operation by operation, without CUDA graphs. | `1` |
-| `EXL3_I2_GRAPH_WIDTH` | The maximum number of tokens of one sequence in one forward pass that runs as a graph. | `8` |
-| `EXL3_I2_KERNELS` | `0` uses the PyTorch forms in the graph and not the decode kernels. | `1` |
-| `EXL3_I2_PREFILL_KERNEL` | `0` uses the PyTorch forms of attention and the block attention residual in prefill. | `1` |
-| `EXL3_I2_FUSE` | `0` keeps the small PyTorch operations between the decode kernels (norms, casts, residuals, output gate). | `1` |
-| `EXL3_I2_EMBED` | `gpu` puts the input embedding table on the first GPU and not in system RAM. | `cpu` |
-| `EXL3_I2_PIPELINED_PREFILL` | `1` lets the generator run its pipelined prefill, where the GPUs of the split work at the same time. Refer to [Limits](#limits) before you set it. | `0` |
-| `EXL3_I2_MOE` | `dense` runs the EXL3 experts in a slow reference loop. Use it to compare with `kernel`. | `kernel` |
-| `EXL3_I2_ADT` | The activation data type: `fp16`, `bf16` or `fp32`. The decode kernels need `fp16`. | `fp16` |
-| `EXL3_I2_NAN_CHECK` | `1` shows a line when a forward pass gives logits that are not finite. | `0` |
+| 1024 x 768 | 520 | 0.21 s |
+| 2048 x 1536 | 2,028 | 1.6 s |
+| 4096 x 4096 | 10,609 | 5.0 s (fp16 attention; 55 s in fp32) |
 
-#### Test results
-
-All results are for the EXL3 conversion on the RTX 4090 + RTX 3090, one sequence.
-
-Decode (`util/inkling2/graph_check.py`):
-
-| Context (tokens) | Operation by operation | CUDA graph with kernels |
-|---|---|---|
-| 600 | 26 T/s | 90 T/s |
-| 2,000 | 26 T/s | 89 T/s |
-| 9,000 | 26 T/s | 86 T/s |
-| 30,000 | 26 T/s | 78 T/s |
-| 45,000 | 26 T/s | 74 T/s |
-
-Forward passes with more than one token of one sequence (`util/inkling2/graph_spec_check.py`):
-
-| Tokens | Operation by operation | Graph |
-|---|---|---|
-| 1 | 39.2 ms | 11.4 ms |
-| 2 | 47.2 ms | 15.0 ms |
-| 4 | 47.6 ms | 18.7 ms |
-| 8 | 48.5 ms | 24.7 ms |
-
-Prefill, one chunk of 2,048 tokens (`util/inkling2/component_bench.py`):
-
-| Context (tokens) | PyTorch forms (`EXL3_I2_PREFILL_KERNEL=0`) | With the extension |
-|---|---|---|
-| 0 | 772 ms (2,650 T/s) | 586 ms (3,500 T/s) |
-| 40,960 | 2,443 ms (840 T/s) | 1,064 ms (1,925 T/s) |
-
-Perplexity over 20,480 tokens (`util/inkling2/ppl_check.py`) is 8.4455 with the extension and 8.4470 with the PyTorch forms. The KL between the two is 0.0015, below the noise floor in the table above.
-
-Through tabbyAPI:
-
-| Test | Result |
-|---|---|
-| Short chats | 74 T/s |
-| 10K-token prompt | Prefill 2,308 T/s, decode 68 T/s |
-| 49K-token prompt | Prefill 1,843 T/s, decode 56 T/s, correct answer to a question about a sentence at 10% depth |
-| 161,543-token prompt (older build, before the graph and kernel work) | Prefill 183 T/s, decode 12.9 T/s, correct answer to a question about a sentence at 10% depth |
+Decode steps of text tokens stay CUDA graph replays in a sequence that has images (88 T/s). A second turn on the same image reuses the cache (83% of a 619-token prompt).
 
 #### How the patch works
 
-- `exllamav3/modules/inkling2.py` has the model in plain PyTorch. It is the reference, and it runs prefill.
+- `exllamav3/architecture/inkling2_vision.py` has the vision tower in plain PyTorch, in fp32. The text model's embedding module takes the rows of image tokens from the image embedding as they are, after its own norm, as the reference does.
+- `exllamav3/modules/inkling2.py` has the text model in plain PyTorch. It is the reference, and it runs prefill.
 - `exllamav3/architecture/inkling2_loop.py` has the modules, the cache state and the graph code. The loop uses the layer map of exllamav3: the looped layers occur three times in the forward order, and each occurrence has its own cache layers.
 - The global layers keep K/V in the paged cache. The sliding layers keep the last window in a buffer for each sequence. All layers keep the last inputs of their convolutions in a ring.
 - A decode step is captured as one CUDA graph for each GPU. All cache indexes are computed on the GPU from two integers, so one captured graph is correct for all positions.
@@ -629,6 +415,8 @@ The checks in `util/inkling2/` compare the port with the transformers reference 
 
 #### Limits
 
+- The vision tower's rotary frequencies are exact fp32 values. The transformers reference rounds them to bf16 when the model is loaded in bf16; the difference at the tower's output is 3e-4.
+- Video input is not implemented (the tower takes single images).
 - Graph decode is for one sequence. Batches, prefill and forward passes wider than `EXL3_I2_GRAPH_WIDTH` run operation by operation.
 - **Pipelined prefill is off.** The generator's prefill pipeline engages when the split is a straight route (first GPU, then second) and then runs the GPUs at the same time. On the development system, the computer power-cycled approximately 2 seconds into a 161K-token prompt, three times out of three, with nothing in the logs; with the pipeline off the same split runs the same prompt. The cause is not established (power delivery, or a fault in the concurrent path), and the pipelined path is not validated against the sequential one for this model. `EXL3_I2_PIPELINED_PREFILL=1` turns it on.
 - Prefill slows down with the context. At 40K tokens of context, approximately half of the prefill time is attention on the global layers.
@@ -643,10 +431,9 @@ The checks in `util/inkling2/` compare the port with the transformers reference 
 3. **Decode.** Of 11.2 ms for each token at 2K context, approximately 7.6 ms is memory traffic: the cuBLAS projections (2.9 ms), the expert kernels (3.5 ms) and the output head (1.1 ms). The own kernels take approximately 2.5 ms. At very long context the K/V of the 8 global layer applications dominate (5.3 GB read per token at 161K). `util/inkling2/graph_profile.py` shows the list.
 4. **Graph steps wider than 8 tokens**, for the n-gram draft verification of tabbyAPI (65 tokens).
 5. **Batched decode** as graphs.
-6. **Vision tower.**
-7. **Quantized cache modes** for the global layers.
-8. **Native NVFP4 expert kernels**, to run the source checkpoint without a conversion.
-9. **Conversion with the stock converter**, which needs support for looped models, and more calibration data for the rare experts.
+6. **Quantized cache modes** for the global layers.
+7. **Native NVFP4 expert kernels**, to run the source checkpoint without a conversion.
+8. **Conversion with the stock converter**, which needs support for looped models, and more calibration data for the rare experts.
 
 ### Control vectors
 
