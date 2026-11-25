@@ -672,6 +672,10 @@ For the design and the validation against the BF16 model, refer to the pull requ
 
 - **Merge kernel.** After each attention and MLP block, the model mixes the two streams and adds the block output. This step was 6 PyTorch operations on FP32 tensors. It is now one Triton program for each token. The result has the same bits as the PyTorch form. The same switch, `EXL3_LOOP_ROUTER_TRITON=0`, selects the PyTorch form.
 - **Router kernel on the second GPU.** Triton launches a kernel on the current device of PyTorch. With the model on a GPU that is not the first one, the router kernel stopped with the error `no kernel image is available for execution on the device`. The two kernels now select the device of their tensors for the launch.
+- **DFlash2 draft model.** [sensenova/SenseNova-Loop-9B-DFlash2](https://huggingface.co/sensenova/SenseNova-Loop-9B-DFlash2) is the official draft model for this target. It works with the DFlash2 code of ExLlamaV3 after three additions:
+  - The draft model names its taps by execution step of the loop (3, 27, 51, 54). DFlash2 now maps each step to a layer and a visit through the layer map of the target, and the Loop block exports the visits that the draft model asks for.
+  - The draft model also takes the final normalized hidden state of the target (`target_feature_sources` ends in `final_postnorm`). The final norm of the target exports this state.
+  - Prefill then runs the target to its output, because a normal prefill stops at the last layer with a K/V cache.
 - **Draft settings.** With 6 draft tokens and a dynamic draft length (confidence 0.4), the MTP draft model is slightly faster than with 4 fixed draft tokens. Refer to [Test results](#test-results-3).
 
 #### Requirements
@@ -719,7 +723,24 @@ Decode speed in T/s, greedy, in the Python API (`util/sensenova_loop/mtp_check.p
 | Edit of a code block | 61.5 | 125.5 | 149.1 |
 | Mean gain | | 2.10 | 2.19 |
 
-Other draft settings gave no gain: 3 or 8 draft tokens, a sparse head of 8,192 or 32,768 tokens, and no hybrid drafting. Without the sparse head, prose decreases from 93 to 70 T/s. An FP16 delta-net state is 3% faster, but one of the five outputs was then different from the output without the draft model.
+Decode speed in T/s with the DFlash2 draft model (BF16, 7 draft tokens, hybrid drafting 7, sparse head 16,384), against the MTP head with 6 draft tokens and a dynamic draft length:
+
+| Prompt | No draft model | MTP, greedy | DFlash2, greedy | MTP, temperature 1 | DFlash2, temperature 1 |
+|---|---:|---:|---:|---:|---:|
+| Code | 61.1 | 156.9 | 197.0 | 142.4 | 214.1 |
+| Math, with thinking | 61.0 | 148.5 | 232.7 | 137.1 | 212.9 |
+| List | 61.0 | 120.5 | 118.1 | 109.5 | 114.9 |
+| Prose | 61.1 | 93.9 | 74.4 | 80.2 | 66.3 |
+| Edit of a code block | 61.5 | 149.1 | 204.4 | 178.5 | 245.8 |
+| Mean gain | | 2.19 | 2.71 | 2.12 | 2.80 |
+
+- **Same output.** With greedy sampling, the output with the DFlash2 draft model was the same as the output without a draft model for all five prompts. The temperature tests use top-p 0.95 and a fixed seed.
+- **Prose.** For prose, the MTP head is faster. The DFlash2 draft model gets approximately 1.65 tokens for each round on prose. A round costs 23 ms: 18.6 ms for the verification pass of 8 tokens and 3.4 ms for the draft model. A step without a draft model costs 16.2 ms.
+- **Draft settings for DFlash2.** A dynamic draft length made DFlash2 slower at each tested confidence (0.1 to 0.6). 5 draft tokens were slower than 7.
+- **Memory.** The DFlash2 draft model adds 2.4 GiB of VRAM. With a cache of 131,072 tokens, the total is 18.5 GiB.
+- **TabbyAPI.** With `draft_mode: model` and `draft_model_name: SenseNova-Loop-9B-DFlash2`, TabbyAPI needs no changes. Decode was 194 T/s for code, 186 T/s for math with thinking and 74 T/s for prose. The tool call, the image question and the prompt of 109,829 tokens gave correct results.
+
+Other MTP draft settings gave no gain: 3 or 8 draft tokens, a sparse head of 8,192 or 32,768 tokens, and no hybrid drafting. Without the sparse head, prose decreases from 93 to 70 T/s. An FP16 delta-net state is 3% faster, but one of the five outputs was then different from the output without the draft model.
 
 Effect of the merge kernel:
 
@@ -756,7 +777,8 @@ The scripts are in `util/sensenova_loop/`:
 
 - **No conversion of my own.** I did not convert the model and did not compare this port with the BF16 model. For the quality of the quantized models, refer to the pull request and the model card.
 - **One GPU.** The generation tests ran on one GPU. On the second GPU, only the two Triton kernels were tested. A split over two GPUs was not tested.
-- **Context.** The longest tested prompt has 109,829 tokens. Quantized cache modes were not tested.
+- **Context.** The longest tested prompt has 109,829 tokens.
+- **DFlash2 draft model not converted.** The draft model runs from its BF16 checkpoint. A quantized version was not tested. Quantized cache modes were not tested.
 - **Control vectors.** The generic control vector patch does not reach the layers in the loop, because these layers have their own forward function.
 
 ### Control vectors
