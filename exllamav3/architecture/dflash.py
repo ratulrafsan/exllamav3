@@ -139,7 +139,7 @@ def dflash_update_kv_from_target(
     target_layer_ids = model.config.target_layer_ids
     if target_layer_ids != sorted(target_layer_ids):
         source_idx = {layer_id: idx for idx, layer_id in enumerate(sorted(target_layer_ids))}
-        target_hidden = [target_hidden[source_idx[layer_id]] for layer_id in target_layer_ids]
+        target_hidden = [target_hidden[source_idx[layer_id]] for layer_id in target_layer_ids] + target_hidden[len(target_layer_ids):]
 
     # May update a few redundant tokens when batching, but we'd never draft longer than the cache length
     if lengths is not None:

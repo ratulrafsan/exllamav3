@@ -38,13 +38,15 @@ def main():
     ap.add_argument("--hybrid", type = int, default = 7)
     ap.add_argument("--sparse", type = int, default = 16384)
     ap.add_argument("--fp16-state", action = "store_true")
+    ap.add_argument("--dflash", help = "directory of a DFlash2 draft model to use in place of the MTP head")
+    ap.add_argument("--temperature", type = float, default = 0, help = "sample with this temperature (top-p 0.95) in place of greedy")
     ap.add_argument("--dynamic", type = float, default = 0, help = "dynamic draft length with this confidence cut")
     args = ap.parse_args()
 
     from exllamav3 import Config, Model, Cache, Tokenizer, Generator
     from exllamav3.generator.sampler import ArgmaxSampler
     config = Config.from_directory(args.model)
-    assert "mtp" in config.model_classes, "no mtp.* tensors found in the model directory"
+    assert args.dflash or "mtp" in config.model_classes, "no mtp.* tensors found in the model directory"
     hist = max(args.draft, args.hybrid)
     rdt = torch.half if args.fp16_state else torch.float
     load = dict(device = torch.device(args.device)) if args.device else {}
@@ -52,13 +54,16 @@ def main():
     model = Model.from_config(config)
     cache = Cache(model, max_num_tokens = args.cache, max_history = hist, recurrent_dtype = rdt)
     model.load(progressbar = True, **load)
-    mtp = Model.from_config(config, component = "mtp")
+    mtp = Model.from_config(Config.from_directory(args.dflash)) if args.dflash else Model.from_config(config, component = "mtp")
     mtp_cache = Cache(mtp, max_num_tokens = args.cache, max_history = hist, recurrent_dtype = rdt)
     mtp.load(**load)
     tokenizer = Tokenizer.from_config(config)
     plain = Generator(model = model, cache = cache, tokenizer = tokenizer)
     stop = [config.eos_token_id, tokenizer.single_id("<|im_end|>"), tokenizer.single_id("<|endoftext|>")]
     greedy = ArgmaxSampler()
+    if args.temperature:
+        from exllamav3.generator.sampler.custom import CustomSampler, SS_Temperature, SS_TopP, SS_Sample
+        greedy = CustomSampler([SS_Temperature(args.temperature), SS_TopP(0.95), SS_Sample()])
     print("loaded: " + ", ".join(
         f"cuda:{d} {torch.cuda.memory_allocated(d) / 2**30:.1f} GiB" for d in range(torch.cuda.device_count())))
 
@@ -66,7 +71,7 @@ def main():
         text, res = g.generate(
             prompt = prompt, max_new_tokens = args.tokens, sampler = greedy, stop_conditions = stop, add_bos = False,
             encode_special_tokens = True, decode_special_tokens = True, completion_only = True,
-            return_last_results = True)
+            return_last_results = True, seed = 1234)
         return text, res["new_tokens"] / res["time_generate"], res
 
     def bench(g, label):

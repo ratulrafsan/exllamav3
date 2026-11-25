@@ -1644,6 +1644,8 @@ class Job:
                 # last cache-writing layer, before final norm. (A drafter fed the last decoder layer's output takes
                 # the regular prefill, which runs through that layer)
                 to_output = gen.mtp_draft and not (dm is not None and dm.caps.get("draft_uses_target_cache"))
+                # So does a DFlash-type drafter whose encoder takes the final normalized state as a feature
+                to_output = to_output or (dm is not None and dm.caps.get("prefill_to_output", False))
                 if to_output:
                     params["last_tokens_only"] = 1
                 then = partial(self.update_draft_from_prefill, seq, prefill_ids, prefill_start) if dm else None

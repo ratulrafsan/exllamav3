@@ -73,7 +73,12 @@ class SenseNovaLoopConfig(Qwen3_5VLBaseConfig):
 class LoopBlock(TransformerBlock):
     def forward(self, x, params, out_dtype = None):
         export_state = params.get("export_state_layers")
-        export_state = export_state and self.layer_idx in export_state and params.get("layer_instance", 0) == 0
+        if export_state and self.layer_idx in export_state:
+            # Drafters that tap layer executions name the visits; others get the first visit
+            visits = params.get("export_state_instances")
+            export_state = params.get("layer_instance", 0) in (visits.get(self.layer_idx, (0,)) if visits else (0,))
+        else:
+            export_state = False
         # Previous non-mHC blocks may defer their residual addition.
         pending = params.pop("resid_pending", None)
         if pending is not None:

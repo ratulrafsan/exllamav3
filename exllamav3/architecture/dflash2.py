@@ -68,6 +68,19 @@ class DFlash2Config(DFlashConfig):
             [float, int], ["dflash_config->output_multiplier", "output_multiplier"], 1.0))
         self.final_logit_softcapping = float(self.read_cfg(
             [float, int], ["dflash_config->final_logit_softcapping", "final_logit_softcapping"], 0.0))
+        # Optional list of the target features the encoder concatenates: the sorted tap ids, optionally followed
+        # by "final_postnorm" (the target's final normalized hidden state, e.g. SenseNova-Loop-9B-DFlash2)
+        sources = self.read_cfg(list, ["target_feature_sources", "loop_teacher->feature_sources"], None)
+        self.final_postnorm = False
+        if sources is not None:
+            raw_ids = sorted(i - self.tap_shift for i in self.target_layer_ids)
+            if sources == raw_ids + ["final_postnorm"]:
+                self.final_postnorm = True
+            elif sources != raw_ids:
+                raise ValueError(
+                    "DFlash2 target_feature_sources must be the sorted target_layer_ids, optionally followed by "
+                    "final_postnorm"
+                )
         assert 0 < self.conv_kernel_size <= self.block_size, \
             "DFlash2 conv_kernel_size must be positive and no larger than block_size"
         assert self.conv_group_size > 0 and self.hidden_size % self.conv_group_size == 0, \
@@ -99,7 +112,7 @@ class DFlash2Model(Model):
             key = self.key_fc,
             key_norm = self.key_fc_norm,
             hidden_size = config.hidden_size,
-            target_state_size = config.hidden_size * len(config.target_layer_ids),
+            target_state_size = config.hidden_size * (len(config.target_layer_ids) + int(config.final_postnorm)),
             mask_token_id = config.mask_token_id,
             rms_norm_eps = config.rms_norm_eps,
             native_draft_len = config.block_size,
@@ -253,9 +266,30 @@ class DFlash2Model(Model):
             raise ValueError("DFlash2 mask_token_id is outside the target vocabulary")
         if target.logit_layer_idx is None:
             raise ValueError("DFlash2 target has no compatible LM head")
-        if any(not 0 <= layer_id < target.config.num_hidden_layers
-               for layer_id in self.config.target_layer_ids):
+        # With a layer map on the target (looped models), tap ids count layer executions: map each to its
+        # (layer, visit). Blocks that honour visits read "export_state_instances"; the list of exported states
+        # stays in execution order, which is the order of the sorted ids
+        layer_map = getattr(target.config, "layer_map", None)
+        ids = self.config.target_layer_ids
+        if layer_map:
+            if any(not 0 <= i < len(layer_map) for i in ids):
+                raise ValueError("DFlash2 target_layer_ids contains an execution step outside the target's layer map")
+            instances = {}
+            for i in ids:
+                instances.setdefault(layer_map[i], set()).add(layer_map[:i].count(layer_map[i]))
+            self.draft_verifier_params.update({
+                "export_state_layers": set(instances),
+                "export_state_instances": instances,
+            })
+        elif any(not 0 <= layer_id < target.config.num_hidden_layers for layer_id in ids):
             raise ValueError("DFlash2 target_layer_ids contains a layer outside the target model")
+        if self.config.final_postnorm:
+            target_norm = target.modules[target.logit_layer_idx - 1]
+            if not isinstance(target_norm, RMSNorm):
+                raise ValueError("DFlash2 final_postnorm needs the target's final RMSNorm right before its LM head")
+            self.draft_verifier_params.update({"export_state_norm_keys": {target_norm.key}})
+            # Prefill must run the target through its final norm (a normal prefill stops at the last K/V layer)
+            self.caps["prefill_to_output"] = True
         self.attached_model = weakref.ref(target)
         self.input_layer.attached_model = weakref.ref(target)
 
