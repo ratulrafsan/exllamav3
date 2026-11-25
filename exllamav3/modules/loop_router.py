@@ -43,8 +43,18 @@ def route(residual, weight, bias, streams, iterations, fixed_identity, pre_scale
 
 
 def merge(residual, branch, post, mix):
+    # The mixing is an elementwise sum in a fixed stream order, not torch.matmul: a cuBLAS matmul of fp32 tensors
+    # picks its kernel by the batch (row) count and, with TF32 enabled (NGC containers set
+    # TORCH_ALLOW_TF32_CUBLAS_OVERRIDE), runs a single row in TF32 but several rows in exact fp32. That made a row of
+    # a verify pass or a prefill differ from the same token decoded alone (~4e-4 per merge). This form is exact fp32
+    # and gives each row the same bits whatever the row count.
     with torch.autocast(device_type = residual.device.type, enabled = False):
-        return torch.matmul(mix.to(residual.dtype), residual) + post.to(branch.dtype).unsqueeze(-1) * branch.unsqueeze(-2)
+        mix = mix.to(residual.dtype).float()
+        res = residual.float()
+        mixed = mix[..., :, 0:1] * res[..., 0:1, :]
+        for j in range(1, res.shape[-2]):
+            mixed = mixed + mix[..., :, j:j + 1] * res[..., j:j + 1, :]
+        return mixed.to(residual.dtype) + post.to(branch.dtype).unsqueeze(-1) * branch.unsqueeze(-2)
 
 
 class LoopRouter(Module):

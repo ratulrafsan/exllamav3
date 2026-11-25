@@ -473,6 +473,8 @@ class Generator:
             draft_model.attach_to(model)
         self.dflash_draft = self.draft_model is not None and self.draft_model.caps.get("dflash_draft", False)
         self.mtp_draft = self.draft_model is not None and self.draft_model.caps.get("mtp_draft", False)
+        if self.mtp_draft and self.target_recurrent:
+            self._warn_inexact_mtp(cache)
 
         # Confidence-calibrated draft truncation (draft model + dynamic draft, any mode). For
         # DFlash the fixed-size drafted block is truncated before verification; for AR draft
@@ -504,6 +506,31 @@ class Generator:
                 embedding = model.modules[0] if self.mtp_draft else None,
             )
             self.sparse_head.benchmark()
+
+
+    @staticmethod
+    def _warn_inexact_mtp(cache):
+        """
+        Greedy MTP output equals plain greedy decoding only if a verify-pass row computes exactly what the same token
+        does in a one-token decode step. Two library defaults break that for a recurrent (GDN) target; note it, since the
+        difference is silent (rare near-tie flips, which then compound). Quality is unaffected.
+        """
+        log = logging.getLogger(__name__)
+        half_state = any(
+            getattr(l, "recurrent_state", None) is not None and l.recurrent_state.dtype == torch.half
+            for l in cache.get_all_recurrent_layers().values()
+        )
+        if half_state:
+            log.info(
+                "MTP drafting with an fp16 recurrent state: greedy output can differ from plain decoding at near-ties "
+                "(both are valid outputs). For bit-identical output use Cache(recurrent_dtype = torch.float)."
+            )
+        if torch.version.hip is None and os.environ.get("EXL3_INT8_GEMV", "2") != "0":
+            log.info(
+                "MTP drafting with EXL3_INT8_GEMV on (the default): 1-2 row calls use the int8-activation GEMV and wider "
+                "verify calls the fp16 kernel, so greedy output can differ from plain decoding at near-ties (both are valid "
+                "outputs). For bit-identical output set EXL3_INT8_GEMV=0 before the model loads."
+            )
 
 
     def num_remaining_jobs(self):

@@ -7,6 +7,7 @@ import math
 import os
 import torch
 from .qwen3_5 import Qwen3_5VLBaseConfig, Qwen3_5BaseModel
+from .qwen3_5_mtp import Qwen3_5MTPModel
 from .qwen3_vl import Qwen3VLVisionModel
 from ..modules.transformer import TransformerBlock
 from ..modules.gated_delta_net import GatedDeltaNet
@@ -49,10 +50,19 @@ class SenseNovaLoopConfig(Qwen3_5VLBaseConfig):
         with open(os.path.join(directory, "config.json"), encoding = "utf8") as f:
             has_vision = isinstance(json.load(f).get("vision_config"), dict) \
                 and os.path.isfile(os.path.join(directory, "preprocessor_config.json"))
-        # No MTP head in Loop checkpoints
+        # The MTP head ships outside the model config (text_config.mtp_num_hidden_layers is 0): register it only
+        # when the directory holds mtp.* tensors (mtp.safetensors in a source model, model-mtp.safetensors in a quant)
         super().__init__(
-            directory, "text_config", SenseNovaLoopModel, Qwen3VLVisionModel if has_vision else None, None, **kwargs
+            directory, "text_config", SenseNovaLoopModel, Qwen3VLVisionModel if has_vision else None,
+            Qwen3_5MTPModel, **kwargs
         )
+        if any(k.startswith("mtp.") for k in self.stc.tensor_file_map):
+            # One dense full-attention layer with an output gate, sharing the target's embedding and lm_head
+            self.mtp_num_hidden_layers = 1
+            self.model_classes["mtp"] = Qwen3_5MTPModel
+        else:
+            self.mtp_num_hidden_layers = 0
+            self.model_classes.pop("mtp", None)
         plan = loop_plan(self.config_dict)
         if self.layer_map_str is not None or (self.layer_map is not None and self.layer_map != plan):
             raise ValueError("Custom layer maps are not supported for SenseNova Loop")
