@@ -550,6 +550,16 @@ Thus, the Inkling-2 architecture has its own reader, with its own variables (`EX
 - **Projection (`project`):** `h = h − s·(h·d)·d`. `d` is the unit direction of the layer application and `s` is the scale. `s = 1` removes the component along `d`.
 - **Addition (`add`):** `h = h + s·v`.
 
+The changes that this needed, beyond the existing patch:
+
+- **A hook in the layer module of this model.** `Inkling2Layer.forward` applies the vector to the tensor that each layer application returns, in the operation-by-operation path and in the decode graph. The block states, the state that each loop pass starts from and the messages to the next pass all come from the changed tensor. This is the effect of a forward hook on the decoder layers of the transformers model, which is how the file was made.
+- **Numbers of layer applications.** The reader maps `direction.N` to application `N − 1` of the forward order: 6 before the loop, 3 × 12 in the loop, 6 after the loop. The file agrees with this numbering. Directions that are next to each other have a cosine of 0.65 to 0.94, except at 7 places where it is 0.17 to 0.32. With this numbering, and only with it, these 7 places are the layer applications where the model starts a new block of 6 layers.
+- **The metadata of the file.** `util/cvec_gguf_to_safetensors.py` wrote only the tensors. It now also writes the `glp.*` and `controlvector.*` metadata. The reader takes the mode (`glp.mode`), the default scale (`glp.alpha_default`) and the structure (`glp.structure = per-execution-step`) from it, and follows the rules of the GLP specification for what a reader must not accept.
+- **Arithmetic and scale.** The projection is computed in fp32 on the fp16 state. The scale is a tensor on the GPU of the layer, so a captured decode graph follows `set_scale` without a new capture. The setter updates the tensor in inference mode, because the tensor is made during a forward pass.
+- **Separate variables** (`EXL3_I2_CVEC*`), so that the patch for `TransformerBlock` does not also read the file.
+- **LoopCD.** In logits mode, the second application of a layer after the loop uses the direction of the first.
+- **Tools.** `util/inkling2/cvec_check.py` tests the hook in the port. `util/inkling2/cvec_ref_dump.py` runs the transformers reference with the forward hooks and `util/inkling2/cvec_ref_compare.py` compares the port with it. `util/inkling2/loopcd_eval.py --mode plain` and `util/inkling2/mode_speed.py` measure quality and speed with the vector on.
+
 A file with one direction for each stored layer (`direction.k` after layer `k`, as llama.cpp applies it) also works: each direction then applies to all applications of its layer. The reader does not accept a hook point other than the layer output, more than one direction for each layer (GLP rank above 1), or additive use of a file that is marked for projection.
 
 Convert the GGUF file one time. The converter keeps the GLP metadata, and the reader takes the mode, the default scale and the numbering from it:
