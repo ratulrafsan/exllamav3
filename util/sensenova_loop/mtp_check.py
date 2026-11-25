@@ -38,6 +38,7 @@ def main():
     ap.add_argument("--hybrid", type = int, default = 7)
     ap.add_argument("--sparse", type = int, default = 16384)
     ap.add_argument("--fp16-state", action = "store_true")
+    ap.add_argument("--dynamic", type = float, default = 0, help = "dynamic draft length with this confidence cut")
     args = ap.parse_args()
 
     from exllamav3 import Config, Model, Cache, Tokenizer, Generator
@@ -78,7 +79,8 @@ def main():
     base = bench(plain, "plain")
     del plain
     drafted = Generator(model = model, cache = cache, tokenizer = tokenizer, draft_model = mtp, draft_cache = mtp_cache,
-                        num_draft_tokens = args.draft, hybrid_draft_tokens = args.hybrid, sparse_draft_head = args.sparse)
+                        num_draft_tokens = args.draft, hybrid_draft_tokens = args.hybrid, sparse_draft_head = args.sparse,
+                        **(dict(dynamic_draft_tokens = True, draft_confidence = args.dynamic) if args.dynamic else {}))
     fast = bench(drafted, "mtp")
 
     print(f"\ndraft {args.draft}, hybrid {args.hybrid}, sparse head {args.sparse}, "

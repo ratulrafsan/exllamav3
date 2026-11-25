@@ -48,6 +48,21 @@ def merge(residual, branch, post, mix):
     # TORCH_ALLOW_TF32_CUBLAS_OVERRIDE), runs a single row in TF32 but several rows in exact fp32. That made a row of
     # a verify pass or a prefill differ from the same token decoded alone (~4e-4 per merge). This form is exact fp32
     # and gives each row the same bits whatever the row count.
+    # All-fp32 CUDA tensors (what the Loop block passes): one fused kernel with the same bits as the form below
+    if (os.environ.get("EXL3_LOOP_ROUTER_TRITON", "1") != "0" and residual.is_cuda and
+        residual.dtype == branch.dtype == post.dtype == mix.dtype == torch.float32 and
+        residual.ndim >= 2 and residual.shape[-2] in (2, 4) and 0 < residual.shape[-1] <= 16384 and
+        branch.shape == residual.shape[:-2] + residual.shape[-1:] and post.shape == residual.shape[:-1] and
+        mix.shape == residual.shape[:-1] + residual.shape[-2:-1] and
+        residual.is_contiguous() and branch.is_contiguous() and post.is_contiguous() and mix.is_contiguous() and
+        branch.device == post.device == mix.device == residual.device and
+        not residual.requires_grad and not branch.requires_grad):
+        try:
+            from .loop_router_triton import merge_triton
+        except ImportError:
+            pass
+        else:
+            return merge_triton(residual, branch, post, mix)
     with torch.autocast(device_type = residual.device.type, enabled = False):
         mix = mix.to(residual.dtype).float()
         res = residual.float()
