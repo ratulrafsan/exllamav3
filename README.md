@@ -48,11 +48,11 @@ The settings for this system are in the TabbyAPI configuration and start script.
 | `EXL3_MOE_CPU_SPLIT_DRAFT` | Keeps the MTP layer fully in VRAM when the CPU expert split is on. |
 | Expert placement | Saves the dynamic CPU-MoE expert placement to a file. Loads the placement at the next start. |
 | Prefill pipeline | Adds engram lookahead, resident-first expert order, stream-ahead and an optional last-page merge. Each item has an `EXL3_*` switch. |
-| Control vectors | Applies llama.cpp control vectors to the residual stream. Refer to [Control vectors](#control-vectors). |
+| Control vectors | Applies llama.cpp control vectors to the residual stream. Refer to [Control vectors](#control-vectors). Inkling-2-Mini has its own reader: refer to [Control vector for Inkling-2](#control-vector-for-inkling-2). |
 | Pipelined prefill with CPU experts | Lets the two GPUs work on different prefill chunks when the CPU expert split is on. This is a port of [a commit by Auryn Macmillan](https://github.com/auryn-macmillan/exllamav3/commit/b38de78bd0376fcdc4f92344ed405800ac8374b6). The port also adds a lock to the n-gram row table. Prefill of prompts longer than one chunk is approximately 10% faster. `EXL3_PIPELINED_PREFILL=0` turns it off. |
 | Late promote hook | Moves the promote-on-miss step off the critical path of decode and makes its budget a setting. Decode is approximately 17% faster on this system. Refer to [Late promote hook](#late-promote-hook). |
 | Expert lookahead (experimental, off by default) | Predicts the experts of the next split layer and copies them from RAM to VRAM before the layer needs them. It needs a source build of the extension. On this system it makes decode slower. Refer to [Expert lookahead](#expert-lookahead). |
-| Inkling-2-Mini (work in progress) | Adds the looped Inkling-2 model (text and image input): load from the source checkpoint or from an EXL3 conversion of its experts, cache, generator, CUDA-graph decode and decode kernels. It needs a source build of the extension for full speed, and TabbyAPI needs the patch `util/inkling2/tabbyapi_inkling2.patch`. Refer to [Inkling-2-Mini](#inkling-2-mini). |
+| Inkling-2-Mini (work in progress) | Adds the looped Inkling-2 model (text and image input): load from the source checkpoint or from an EXL3 conversion of its experts, cache, generator, CUDA-graph decode and decode kernels. It needs a source build of the extension for full speed, and TabbyAPI needs the patch `util/inkling2/tabbyapi_inkling2.patch`. It also has LoopCD decoding and a reader for control vectors with one direction for each layer application; both are off by default. Refer to [Inkling-2-Mini](#inkling-2-mini). |
 
 ### Late promote hook
 
@@ -243,6 +243,8 @@ The layer math and the NVFP4 / MXFP8 dequantizers are adapted from [0xSero/inkli
 | Prefill | Attention and the block attention residual run through the extension (cuBLAS products on fp16 inputs with fp32 accumulation, own kernels). The rest is plain PyTorch. The pipelined prefill of the generator is off for this model. Refer to [Limits](#limits). |
 | MTP head (`mtp.safetensors`, DSpark draft model) | Works as a draft model (`architecture/inkling2_dspark.py`), in the Python API and in TabbyAPI (`draft_mode: model`, `draft_num_tokens: 7`, `dynamic_draft: true`; the model directory comes from `util/inkling2/make_dspark_dir.py`). Refer to the TabbyAPI results below. Not quantized. |
 | Vision | Works: the vision tower is the `vision` component of the model (`architecture/inkling2_vision.py`), in the Python API and in TabbyAPI (`vision: true`, with the TabbyAPI patch). Refer to [Images](#images). |
+| LoopCD decoding | Works in both modes of the paper (hidden state and logits), uncached, cached and as graph replays. Off by default. In the tests here it does not give a measurable gain for this model. Refer to [LoopCD](#loopcd). |
+| Control vectors | Works for GLP files with one direction for each layer application, and for files with one direction for each stored layer. Off by default. Refer to [Control vector for Inkling-2](#control-vector-for-inkling-2). |
 | Tensor parallelism | Not supported. |
 
 #### Requirements
@@ -364,6 +366,15 @@ The same measure on ExLlamaV3's benchmark trace (`eval/qbench_prompts.py`: conve
 | `EXL3_I2_NAN_CHECK` | `1` shows a line when a forward pass gives logits that are not finite. | `0` |
 | `EXL3_I2_VISION_DEVICE` | Where the vision tower loads: `last` (the last GPU), `first` (the device the loader gives it), `cpu` or `cuda:N`. | `last` |
 | `EXL3_I2_VISION_FP16_PATCHES` | Images with more patches than this run the tower's attention in fp16. | `12000` |
+| `EXL3_I2_LOOPCD` | LoopCD mode: `off`, `hidden` or `logits`. Refer to [LoopCD](#loopcd). | `off` |
+| `EXL3_I2_LOOPCD_REF` | The reference pass of LoopCD: `1` or `2`. | `1` |
+| `EXL3_I2_LOOPCD_W` | The fixed strength of LoopCD. | `0.3`, or `0` when `EXL3_I2_LOOPCD_WMAX` is set |
+| `EXL3_I2_LOOPCD_WMAX` | Logits mode: the cap of the adaptive strength. `0` is a fixed strength only. | `0` |
+| `EXL3_I2_CVEC` | The control vector file (safetensors). Refer to [Control vector for Inkling-2](#control-vector-for-inkling-2). | Not set: off |
+| `EXL3_I2_CVEC_MODE` | `project` or `add`. | The `glp.mode` of the file, or `project` |
+| `EXL3_I2_CVEC_SCALE` | The scale of the control vector. | The `glp.alpha_default` of the file, or `1` |
+| `EXL3_I2_CVEC_LAYERS` | `a-b`: use only `direction.a` to `direction.b` of the file. | All directions |
+| `EXL3_I2_PASSES` | Runs only the first N loop passes. For tests: the reference logits of LoopCD are the logits of the model with as many passes as the reference pass. | `0` (all passes) |
 | `EXL3_I2_DSPARK_WINDOW` | Limits the context of the drafter's full-attention layer to this number of tokens. `0` is all of it. Refer to the drafter results before you set it. | `0` |
 
 #### Test results
@@ -463,6 +474,122 @@ Checks (`util/inkling2/vision_check.py` against `util/inkling2/ref_dump_vision.p
 
 Decode steps of text tokens stay CUDA graph replays in a sequence that has images (88 T/s). A second turn on the same image reuses the cache (83% of a 619-token prompt).
 
+#### LoopCD
+
+[LoopCD](https://arxiv.org/abs/2610.02185) ("Decoding Looped Transformers Better for (Almost) Free") is contrastive decoding for looped transformers, without training and without a second model. A looped model decodes only the state after its last pass. LoopCD also uses the state after an earlier pass (the reference) and moves the output away from it. [InferMatrixLab/vllm-rlt #101](https://github.com/InferMatrixLab/vllm-rlt/pull/101) implements it in vLLM for the Ouro models. This is an implementation for Inkling-2-Mini. It is off by default.
+
+> [!NOTE]
+> In the tests below LoopCD does not give a measurable gain for Inkling-2-Mini. The tests score one answer token and next-token prediction. They do not test generation with reasoning, where the paper reports its largest gains.
+
+The two modes of the paper:
+
+- **Hidden state (`hidden`).** The hidden state that goes into the layers after the loop becomes `h + w·(h − h_ref)`. `h` is the state after the last pass and `h_ref` is the state after the reference pass. This mode has no cost. The layers after the loop, and their caches, see the changed state for all tokens.
+- **Logits (`logits`).** The layers after the loop and the output head also run on the state of the reference pass. The logits become `z + w·(z − z_ref)`. The strength `w` is fixed, or adaptive: `w = w_max·(1 − (p1 − p2))`, where `p1` and `p2` are the two largest probabilities of the unguided output. The adaptive strength is largest when the first two tokens have the same probability.
+
+Ouro has no layers after its loop, so its reference logits are one more call of the output head. Inkling-2-Mini has 6 layers after the loop, and they have K/V caches and convolution state. In logits mode this implementation gives the reference readout its own cache layers. Thus, the reference logits are exactly the logits of the model with only the reference pass (or the first two passes) for the same tokens. `util/inkling2/loopcd_check.py` tests this against the model loaded with `EXL3_I2_PASSES`.
+
+Set the mode in the environment of the process that loads the model:
+
+```sh
+EXL3_I2_LOOPCD=logits EXL3_I2_LOOPCD_REF=1 EXL3_I2_LOOPCD_W=0.3 python main.py        # fixed strength
+EXL3_I2_LOOPCD=logits EXL3_I2_LOOPCD_WMAX=0.5 python main.py                          # adaptive strength
+EXL3_I2_LOOPCD=hidden EXL3_I2_LOOPCD_W=0.3 python main.py
+```
+
+In Python, call `config.set_loopcd(mode, ref, strength, wmax)` before `Model.from_config`. On a loaded model, `model.set_loopcd(strength = ..., wmax = ...)` changes the strength from the next forward pass. It also changes between `off` and `hidden`. Logits mode is fixed when the model is created, because it adds cache layers. With `params["loopcd_export"] = True`, a forward pass in logits mode also returns the two sets of logits in `params["loopcd_logits"]`.
+
+Quality, 6 bpw conversion (`util/inkling2/loopcd_eval.py`). The multiple-choice test has 4,172 questions (ARC-Challenge test, 1,172; MMLU test, 3,000 from 37 subjects; get them with `util/inkling2/loopcd_fetch_mc.py`). Each question is a chat turn with thinking effort 0, and the answer is the option letter with the highest logit. "Better" and "worse" count the questions whose answer changed to correct or to wrong. `p` is from a sign test on these two counts. The text test is top-1 accuracy of the next token on 20 rows of 1,024 tokens.
+
+| Setting | Multiple choice | Better / worse | p | Text top-1 |
+|---|---|---|---|---|
+| Plain model | 81.64% | | | 52.13% |
+| Reference pass 1 alone (the model with 1 pass) | 23.42% | | | 42.10% |
+| Reference pass 2 alone (the model with 2 passes) | 35.31% | | | 46.23% |
+| Logits, reference 1, fixed 0.1 | 81.76% | 16 / 11 | 0.44 | 52.19% |
+| Logits, reference 1, fixed 0.3 | 81.90% | 37 / 26 | 0.21 | 51.48% |
+| Logits, reference 1, fixed 0.5 | 81.86% | 48 / 39 | 0.39 | 50.23% |
+| Logits, reference 1, fixed 1.0 | 81.90% | 74 / 63 | 0.39 | 44.53% |
+| Logits, reference 1, adaptive, cap 0.5 | 81.88% | 41 / 31 | 0.29 | 51.14% |
+| Logits, reference 1, adaptive, cap 1.0 | 81.86% | 54 / 45 | 0.42 | 48.35% |
+| Logits, reference 2, fixed 0.3 | 81.71% | 24 / 21 | 0.77 | 51.90% |
+| Logits, reference 2, fixed 0.5 | 81.86% | 35 / 26 | 0.31 | 50.89% |
+| Logits, reference 2, adaptive, cap 0.5 | 81.81% | 30 / 23 | 0.41 | 51.49% |
+| Hidden, reference 1, 0.25 | 81.78% | 11 / 5 | 0.21 | 52.09% |
+| Hidden, reference 1, 0.5 | 81.74% | 15 / 11 | 0.56 | 51.99% |
+| Hidden, reference 1, 1.0 | 81.71% | 20 / 17 | 0.74 | 51.87% |
+| Hidden, reference 2, 0.5 | 81.78% | 21 / 15 | 0.41 | 52.02% |
+| Hidden, reference 2, 1.0 | 81.81% | 29 / 22 | 0.40 | 51.80% |
+
+- All settings are 0.0 to 0.3 points above the plain model on the questions. No difference is significant: the smallest p is 0.21. The paper reports +0.3 to +1.6 points for its models on its multiple-choice tests.
+- Next-token accuracy on text decreases when the strength increases. In logits mode the decrease is large from a strength of 0.5.
+- The early passes are weak alone. With 1 pass the model answers the questions at the level of a guess, and with 2 passes it has 35%. Thus, a lower number of passes with LoopCD, which the paper shows for other models, is not an option for this model.
+
+Cost (`util/inkling2/mode_speed.py`: 8K tokens of context, cache of 16K tokens; TabbyAPI: cache of 163,840 tokens, short chats, greedy):
+
+| Setting | Prefill | Decode | TabbyAPI decode | VRAM |
+|---|---|---|---|---|
+| Plain model | 3,293 T/s | 11.33 ms (88.2 T/s) | 89.3 T/s | |
+| Hidden | 3,290 T/s | 11.34 ms (88.2 T/s) | 88.8 T/s | The same |
+| Logits, fixed or adaptive | 2,712 T/s (−18%) | 12.93 ms (77.3 T/s, −12%) | 77.7 T/s (−13%) | +0.7 GiB at a cache of 163,840 tokens, on the GPU of the last layer |
+
+In logits mode each layer after the loop runs two times in a row: on the state of the last pass, then on the reference state. The two readouts thus go to the next GPU together. With the reference readout after the full readout of the last pass, a GPU split inside these layers sent the state across two more times in each forward pass, and prefill was 28% slower than the plain model.
+
+#### Control vector for Inkling-2
+
+A control vector for Inkling-2-Mini can have one direction for each layer application ("execution step"): the loop layers run three times with the same weights, but their activations in the three passes are different. [msuiche/Inkling-2-Mini-abliterated-cyber-GLP-48-L1-48](https://huggingface.co/msuiche/Inkling-2-Mini-abliterated-cyber-GLP-48-L1-48) is a file of this type: a [GLP](https://github.com/msuiche/weightless/blob/main/docs/spec/GLP.md) file with 48 directions for the 24 layers, for projection.
+
+The patch in [Control vectors](#control-vectors) cannot apply such a file:
+
+- It changes `TransformerBlock`. This model has its own layer module.
+- It counts directions by stored layer, from 0. In this file, `direction.N` is for layer application `N − 1`, and there are 48 of them.
+- It does not read the GLP metadata (mode, default strength).
+- With `EXL3_CVEC` set, it applies the first directions of the file to the three layers of the DSpark draft model, which are `TransformerBlock` modules.
+
+Thus, the Inkling-2 architecture has its own reader, with its own variables (`EXL3_I2_CVEC`, not `EXL3_CVEC`). It applies the vector to the output of each layer application, for all token positions:
+
+- **Projection (`project`):** `h = h − s·(h·d)·d`. `d` is the unit direction of the layer application and `s` is the scale. `s = 1` removes the component along `d`.
+- **Addition (`add`):** `h = h + s·v`.
+
+A file with one direction for each stored layer (`direction.k` after layer `k`, as llama.cpp applies it) also works: each direction then applies to all applications of its layer. The reader does not accept a hook point other than the layer output, more than one direction for each layer (GLP rank above 1), or additive use of a file that is marked for projection.
+
+Convert the GGUF file one time. The converter keeps the GLP metadata, and the reader takes the mode, the default scale and the numbering from it:
+
+```sh
+python -I util/cvec_gguf_to_safetensors.py glp.inkling2mini-GLP-48-L1-48.gguf inkling2_glp48.safetensors
+EXL3_I2_CVEC=/path/to/inkling2_glp48.safetensors python main.py
+```
+
+The log shows a line of this type when the vector is active:
+
+```
+ -- Inkling2 control vector: mode = project, scale = 0.25, directions 1..48 (one per layer application), 48 layer applications steered, from ...
+```
+
+`EXL3_I2_CVEC_SCALE` sets a different scale. In Python, `config.cvec.set_scale(s)` changes it on a loaded model. The variables are in the settings table of this section.
+
+Test results with the file above (6 bpw conversion, except where noted):
+
+| Test | Result |
+|---|---|
+| `util/inkling2/cvec_check.py` (4 bpw, one GPU) | Scale 0 gives the logits of the plain model bit for bit, uncached, cached and as graph replays. At scale 1 the component along the direction is removed at each of the 48 layer applications (mean `\|h·d\|` 5.87 before, 0.001 after), and the next application receives the changed state. At scale 0.25 the component is 0.750 to 0.751 of its value before. Graph replays and operation-by-operation steps agree as for the plain model. |
+| Against the transformers reference with a forward hook on each decoder layer (`util/inkling2/cvec_ref_compare.py`, 5 prompts) | The change of the logits from scale 0 has a cosine of 0.95 to 0.99 with the change in the reference, and 0.78 to 1.04 of its size. The top token changes at the same share of the positions (15 to 26% at scale 0.25, 21 to 63% at scale 1). The rest is the routing noise between two implementations of this model. |
+| Multiple choice, 4,172 questions (the test of [LoopCD](#loopcd)) | Plain 81.64%. Scale 0.1: 81.45%. Scale 0.25: 78.88% (MMLU part: 76.80% to 73.57%). |
+| Text, top-1 accuracy of the next token | Plain 52.13%. Scale 0.1: 52.15%. Scale 0.25: 51.67%. |
+| Speed (`util/inkling2/mode_speed.py`) | Prefill does not change (3,288 T/s against 3,293 T/s). Decode is 11.71 ms against 11.33 ms for each token (−3%). TabbyAPI, short chats: 86.2 T/s against 89.3 T/s. |
+| First 12 tokens of the reply, thinking effort 0, greedy: 8 requests that the plain model refuses, 4 harmless requests | The 8 replies start with a refusal at scales 0, 0.1, 0.25 (the default of the file), 0.35 and 0.5. At scale 1, 5 of 8 start with a refusal. The 4 harmless requests get an answer at all scales, and the text is coherent at all scales. |
+
+The model card of the file reports a larger effect at scale 0.25 than these tests show: 67.2% against 80.8% on an MMLU subset, and no refusals. This port and the transformers reference agree on the effect of the vector, so the difference is not in this reader. Its cause is not known. The tests here do not include generation with reasoning, and they do not use the test prompts of the model card.
+
+Limits:
+
+- The vector applies to all requests of the process.
+- The DSpark draft model is not steered. The steered model does the verification of all draft tokens, so the output is the output of the steered model. The draft model reads the steered states, which it was not trained on: fewer draft tokens can be accepted. This is not measured.
+- The projection is a few small PyTorch operations for each layer application in the decode graph. A kernel can remove most of the 3% decode cost.
+- A control vector is specific to one model. Do not use a vector from a different model.
+
+> [!NOTE]
+> A refusal vector removes a safety behavior of the model. You are responsible for the output of the model.
+
 #### How the patch works
 
 - `exllamav3/architecture/inkling2_vision.py` has the vision tower in plain PyTorch, in fp32. The text model's embedding module takes the rows of image tokens from the image embedding as they are, after its own norm, as the reference does.
@@ -473,12 +600,17 @@ Decode steps of text tokens stay CUDA graph replays in a sequence that has image
 - `exllamav3/exllamav3_ext/inkling2.cu` has six kernels that replace groups of small PyTorch operations in the graph: convolution (with the residual and the fp16 cast), block attention residual, message gate, RMS norm with gain and cast, Q/K/V post-processing and attention (with the output gate). A decode step is approximately 1,170 kernel launches.
 - Prefill attention has three steps for each chunk of queries, in the same file. `i2_attn_qk` computes the logits with cuBLAS from the fp16 values of Q and K, with fp32 accumulation. `i2_attn_soft` applies the scale, the relative bias, the masks and the exponentials in one kernel. `i2_attn_pv` multiplies the weights with V; each weight goes in as two fp16 terms, which keeps approximately 22 bits. K and V are read in place from the cache. The results have the accuracy of the fp32 PyTorch form.
 
+- LoopCD keeps the state that the reference pass leaves (the hidden state and the block states) when the next pass starts. Hidden mode mixes it into the hidden state at the first layer after the loop. Logits mode adds a second application of each layer after the loop to the layer map (instance 1 of the layer, with its own cache layers), swaps the two states before each application, and gives both final states to the head, which computes both sets of logits with one product. The strength is a tensor on the GPU, so a captured decode graph follows a change of it.
+- The control vector is applied to the tensor that each layer application returns. The directions and the scale are tensors on the GPU of the layer.
+
 The checks in `util/inkling2/` compare the port with the transformers reference (`ref_dump.py`, `port_check.py`), cached decode with an uncached pass (`cache_check.py`) and graph decode with operation-by-operation decode (`graph_check.py`, `graph_seq_check.py`, `graph_spec_check.py`).
 
 #### Limits
 
 - The vision tower's rotary frequencies are exact fp32 values. The transformers reference rounds them to bf16 when the model is loaded in bf16; the difference at the tower's output is 3e-4.
 - Video input is not implemented (the tower takes single images).
+- LoopCD is tested with single-token scoring and next-token prediction only. It is not tested with a generation benchmark, with reasoning, or with the draft model. The draft model is not guided, so fewer of its tokens can be accepted.
+- LoopCD and the control vector are settings of the process. They cannot be set for each request.
 - Graph decode is for one sequence. Batches, prefill and forward passes wider than `EXL3_I2_GRAPH_WIDTH` run operation by operation.
 - **Pipelined prefill is off.** The generator's prefill pipeline engages when the split is a straight route (first GPU, then second) and then runs the GPUs at the same time. On the development system, the computer power-cycled approximately 2 seconds into a 161K-token prompt, three times out of three, with nothing in the logs; with the pipeline off the same split runs the same prompt. The cause is not established (power delivery, or a fault in the concurrent path), and the pipelined path is not validated against the sequential one for this model. `EXL3_I2_PIPELINED_PREFILL=1` turns it on.
 - Prefill slows down with the context. At 40K tokens of context, approximately half of the prefill time is attention on the global layers.
@@ -509,6 +641,8 @@ The patch has two modes:
 - **Addition (`add`).** The patch adds the vector to the residual stream: `h = h + s·v`. This is the standard llama.cpp mode.
 
 The patch is off by default. It has no effect until you set `EXL3_CVEC`.
+
+This patch is for models that use `TransformerBlock`. Inkling-2-Mini has its own reader, for vectors with one direction for each layer application: refer to [Control vector for Inkling-2](#control-vector-for-inkling-2).
 
 #### Prepare the vector file
 

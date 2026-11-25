@@ -6,6 +6,12 @@ to safetensors for the control-vector patch (EXL3_CVEC, exllamav3/modules/transf
 
 Layer numbering is kept as llama.cpp's: "direction.k" applies after decoder layer k (0-based),
 and llama.cpp never stores a direction for layer 0. Only reads; nothing in the file is executed.
+
+Also reads GLP files (projective control vectors, github.com/msuiche/weightless docs/spec/GLP.md): the tensors
+are kept under their names and the file's `glp.*`, `controlvector.*` and `general.name` metadata go into the
+safetensors metadata, as strings. The Inkling-2 control vector reader (EXL3_I2_CVEC,
+exllamav3/architecture/inkling2_loop.py) takes mode, default strength and numbering from them: in a file with
+`glp.structure = per-execution-step`, "direction.N" is for layer application N - 1.
 """
 import struct, sys
 import numpy as np
@@ -91,8 +97,13 @@ def main():
         print("other tensors (ignored):", other)
     if dst:
         from safetensors.numpy import save_file
+        keep = {k: (str(v).lower() if isinstance(v, bool) else str(v)) for k, v in meta.items()
+                if not isinstance(v, list) and (k.startswith(("glp.", "controlvector.")) or k == "general.name")}
+        per_step = meta.get("glp.structure") == "per-execution-step"
         save_file({k: v for k, v in tensors.items() if k.startswith("direction.")}, dst,
-                  metadata = {"source": src.rsplit("/", 1)[-1], "convention": "llama.cpp direction.k = after layer k"})
+                  metadata = {"source": src.rsplit("/", 1)[-1],
+                              "convention": "direction.N = layer application N - 1" if per_step
+                              else "llama.cpp direction.k = after layer k", **keep})
         print("wrote", dst)
 
 

@@ -2,6 +2,7 @@ from __future__ import annotations
 from typing_extensions import override
 import json
 import os
+import re
 import weakref
 import torch
 
@@ -407,9 +408,226 @@ _GRAPH_MIN_POS = 8
 _GRAPH_MAX_WIDTH = int(os.environ.get("EXL3_I2_GRAPH_WIDTH", 8))
 _STATS = int(os.environ.get("EXL3_I2_STATS", 0))
 _GRAPH_MAX_GRAPHS = 4
+# Run only the first N loop passes (0: all of them). For tests: the reference logits of LoopCD are the logits of the
+# model with as many passes as the reference pass
+_PASSES = int(os.environ.get("EXL3_I2_PASSES", 0))
+
+
+class LoopCD:
+    """
+    LoopCD (arXiv:2610.02185, "Decoding Looped Transformers Better for (Almost) Free"): contrastive decoding
+    between the state the last loop pass leaves and the state an earlier pass left, both read out by the same
+    layers after the loop and the same head. No second model, no training.
+
+        mode "hidden"   the hidden state that enters the layers after the loop becomes h + w * (h - h_ref)
+                        (eq. 2). No extra work; the layers after the loop see the changed state, and so do their
+                        caches.
+        mode "logits"   the layers after the loop and the head also run on the reference pass's state, and the
+                        logits become z + w * (z - z_ref) (eq. 3). The reference readout has its own K/V and
+                        convolution state (a second application of each layer after the loop, see
+                        Inkling2LoopConfig.set_loopcd), so z_ref is exactly what the model with `ref` passes
+                        would return for the same tokens.
+
+        ref             the reference pass, counted from 1; before the last pass
+        strength        w, fixed
+        wmax            logits mode: an adaptive part on top (eq. 4), w = strength + wmax * (1 - (p1 - p2)) with
+                        p1, p2 the two largest probabilities of softmax(z): strongest when the top two
+                        tokens are tied, `strength` alone when one dominates. The paper uses either a fixed w
+                        (wmax 0) or the adaptive rule alone (strength 0)
+
+    From the environment: EXL3_I2_LOOPCD = off | hidden | logits, EXL3_I2_LOOPCD_REF (1),
+    EXL3_I2_LOOPCD_W (0.3, or 0 when a cap is given), EXL3_I2_LOOPCD_WMAX (0). Strength and cap can change while
+    the model is loaded (Inkling2LoopModel.set_loopcd); the mode is fixed for "logits", which adds cache layers.
+    """
+
+    MODES = ("off", "hidden", "logits")
+
+    def __init__(self, mode: str = "off", ref: int = 1, strength: float = 0.3, wmax: float = 0.0):
+        assert mode in self.MODES, f"LoopCD: mode must be one of {self.MODES}"
+        assert strength >= 0 and wmax >= 0, "LoopCD: strength and wmax must not be negative"
+        self.mode, self.ref = mode, int(ref)
+        self.strength, self.wmax = float(strength), float(wmax)
+        self._ctl = {}                  # device -> fp32 [2] (strength, wmax): what a captured decode step reads
+
+    @staticmethod
+    def from_env() -> "LoopCD":
+        env = os.environ.get
+        wmax = float(env("EXL3_I2_LOOPCD_WMAX", 0))
+        return LoopCD(
+            env("EXL3_I2_LOOPCD", "off").lower(), int(env("EXL3_I2_LOOPCD_REF", 1)),
+            float(env("EXL3_I2_LOOPCD_W", 0.0 if wmax else 0.3)), wmax,
+        )
+
+    def ctl(self, device) -> torch.Tensor:
+        t = self._ctl.get(device)
+        if t is None:
+            t = self._ctl[device] = torch.tensor([self.strength, self.wmax], dtype = torch.float32, device = device)
+        return t
+
+    def set_strength(self, strength: float | None = None, wmax: float | None = None):
+        if strength is not None:
+            self.strength = float(strength)
+        if wmax is not None:
+            self.wmax = float(wmax)
+        assert self.strength >= 0 and self.wmax >= 0, "LoopCD: strength and wmax must not be negative"
+        # (the tensors are made inside a forward, so they are inference tensors)
+        with torch.inference_mode():
+            for t in self._ctl.values():
+                t.copy_(torch.tensor([self.strength, self.wmax], dtype = torch.float32))
+
+    def __repr__(self):
+        if self.mode == "off":
+            return "off"
+        w = f"strength {self.strength:g}" + (f" + adaptive up to {self.wmax:g}" if self.wmax else "")
+        return f"{self.mode}, reference pass {self.ref}, {w}"
 _GRAPH_WIDTHS = (1, 2, 4, 8)
 # Debug: report non-finite logits of any forward (costs a device sync per forward)
 _NAN_CHECK = os.environ.get("EXL3_I2_NAN_CHECK", "0") != "0"
+
+
+class ControlVector:
+    """
+    A control vector on the output of the layer applications: the hook point "residual_stream_post_layer" of
+    llama.cpp control vectors and of GLP files (github.com/msuiche/weightless, docs/spec/GLP.md). Every token
+    position is steered, the prompt included.
+
+        project     h <- h - a * (h . d) d      d: the direction, unit length; a = scale * |stored vector|.
+                                                a = 1 removes the component along d
+        add         h <- h + scale * v          v: the stored vector
+
+    Directions are counted per layer application ("execution step"), not per stored layer: the loop layers run
+    three times with the same weights but different activations, and a file made for the model (GLP
+    `glp.structure = per-execution-step`) has one direction for each of the 48 applications, `direction.N` for
+    application N - 1. A file with one direction per stored layer (`direction.k` after layer k, counted from 0,
+    as llama.cpp applies them) steers every application of that layer.
+
+    The file is safetensors, written by util/cvec_gguf_to_safetensors.py from the GGUF (it keeps the GLP
+    metadata). From the environment:
+
+        EXL3_I2_CVEC          the file; unset = off
+        EXL3_I2_CVEC_MODE     project | add. Default: the file's `glp.mode`, else project. A file marked
+                              `project` is not applied additively
+        EXL3_I2_CVEC_SCALE    the scale. Default: the file's `glp.alpha_default`, else 1
+        EXL3_I2_CVEC_LAYERS   a-b: only `direction.a` .. `direction.b` (the numbers in the file). Default: all
+
+    These are separate from the EXL3_CVEC settings of the control-vector patch for TransformerBlock models, which
+    would number this model's directions by stored layer (and steer the draft model's layers with them).
+
+    The scale can change while the model is loaded (set_scale): a captured decode step reads it from a tensor.
+    With LoopCD in logits mode, the reference readout's layer applications take the directions of the same
+    layers' applications after the last pass.
+    """
+
+    # Test hook: a list that receives (application, h . d before, h . d after) for every steered application
+    TRACE = None
+
+    def __init__(self, path: str, cfg: I2.Inkling2Cfg, mode: str | None = None, scale: float | None = None,
+                 layers: tuple | None = None):
+        from safetensors import safe_open
+        vecs = {}
+        with safe_open(path, framework = "pt") as f:
+            meta = f.metadata() or {}
+            for k in f.keys():
+                m = re.fullmatch(r"direction\.(\d+)", k)
+                if m:
+                    vecs[int(m.group(1))] = f.get_tensor(k).float().flatten()
+                elif k.startswith("direction."):
+                    raise ValueError(f"Control vector {path}: {k}: files with more than one direction per layer "
+                                     "(GLP rank > 1) are not supported")
+        assert vecs, f"Control vector {path}: no direction.<N> tensors"
+        assert all(v.numel() == cfg.hidden for v in vecs.values()), \
+            f"Control vector {path}: directions are not of the model's hidden size ({cfg.hidden})"
+
+        # What the file says about itself (GLP), and what this reader does not implement
+        hook = meta.get("glp.hook_point", "residual_stream_post_layer")
+        if hook != "residual_stream_post_layer":
+            raise ValueError(f"Control vector {path}: hook point {hook!r} is not supported (only the layer output)")
+        if int(meta.get("glp.rank", 1)) != 1 or int(meta.get("glp.spec_version", 1)) != 1:
+            raise ValueError(f"Control vector {path}: GLP spec version {meta.get('glp.spec_version')} / rank "
+                             f"{meta.get('glp.rank')} is not supported (version 1, rank 1)")
+        file_mode = meta.get("glp.mode")
+        self.mode = (mode or file_mode or "project").strip().lower()
+        if self.mode not in ("project", "add"):
+            raise ValueError(f"Control vector: mode must be project or add, not {self.mode!r}")
+        if file_mode == "project" and self.mode == "add":
+            raise ValueError(f"Control vector {path}: the file is for projection (glp.mode = project); it must "
+                             "not be applied additively")
+        if scale is None:
+            scale = float(meta.get("glp.alpha_default", 1.0)) if self.mode == "project" else 1.0
+        self.scale, self.path = float(scale), path
+
+        # direction number -> layer applications
+        apps = cfg.applications
+        per_step = meta.get("glp.structure") == "per-execution-step" or max(vecs) >= cfg.layers
+        if per_step:
+            assert min(vecs) >= 1 and max(vecs) <= len(apps), \
+                f"Control vector {path}: directions {min(vecs)}..{max(vecs)} for a model of {len(apps)} layer " \
+                "applications (direction.N is application N - 1)"
+            where = {n: [n - 1] for n in vecs}
+        else:
+            where = {n: [a for a, (layer, _) in enumerate(apps) if layer == n] for n in vecs}
+        self.per_step = per_step
+        lo, hi = layers or (0, 1 << 30)
+        self.vecs, self.norms = {}, {}                      # application -> unit direction or stored vector, |v|
+        for n, v in vecs.items():
+            norm = float(v.norm())
+            if not lo <= n <= hi or norm == 0.0:
+                continue
+            for a in where[n]:
+                self.vecs[a] = v / norm if self.mode == "project" else v
+                self.norms[a] = norm if self.mode == "project" else 1.0
+        self.used = sorted(n for n in vecs if lo <= n <= hi)
+        self._dev = {}                                      # device -> (directions [apps, D], coefficients [apps])
+
+    @staticmethod
+    def from_env(cfg: I2.Inkling2Cfg) -> "ControlVector | None":
+        env = os.environ.get
+        path = env("EXL3_I2_CVEC")
+        if not path:
+            return None
+        rng = env("EXL3_I2_CVEC_LAYERS")
+        scale = env("EXL3_I2_CVEC_SCALE")
+        cv = ControlVector(
+            path, cfg, env("EXL3_I2_CVEC_MODE"), float(scale) if scale else None,
+            tuple(int(t) for t in rng.split("-")) if rng else None,
+        )
+        print(f" -- Inkling2 control vector: {cv}")
+        return cv
+
+    def __repr__(self):
+        u = self.used
+        return (f"mode = {self.mode}, scale = {self.scale:g}, directions {u[0] if u else '-'}..{u[-1] if u else '-'} "
+                f"({'one per layer application' if self.per_step else 'one per stored layer'}), "
+                f"{len(self.vecs)} layer applications steered, from {self.path}")
+
+    def _coefs(self, n: int) -> torch.Tensor:
+        return torch.tensor([self.scale * self.norms.get(a, 0.0) for a in range(n)], dtype = torch.float32)
+
+    def tensors(self, device):
+        t = self._dev.get(device)
+        if t is None:
+            n = max(self.vecs) + 1
+            d = torch.zeros((n, next(iter(self.vecs.values())).numel()), dtype = torch.float32)
+            for a, v in self.vecs.items():
+                d[a] = v
+            t = self._dev[device] = (d.to(device), self._coefs(n).to(device))
+        return t
+
+    def set_scale(self, scale: float):
+        self.scale = float(scale)
+        with torch.inference_mode():
+            for d, c in self._dev.values():
+                c.copy_(self._coefs(c.shape[0]))
+
+    def apply(self, h: torch.Tensor, app: int) -> torch.Tensor:
+        """h: [S, D], the output of layer application `app`. Computed in fp32, returned in h's dtype"""
+        if app not in self.vecs:
+            return h
+        d, c = self.tensors(h.device)
+        out = I2.control_vector(h, d[app], c[app], self.mode == "add")
+        if ControlVector.TRACE is not None:
+            ControlVector.TRACE.append((app, (h.float() @ d[app]).cpu(), (out.float() @ d[app]).cpu()))
+        return out
 
 
 class Inkling2LoopConfig(Config):
@@ -419,6 +637,8 @@ class Inkling2LoopConfig(Config):
         super().__init__(directory, {"text": Inkling2LoopModel}, config_key = "text_config", **kwargs)
         self.i2 = I2.Inkling2Cfg.from_dict(self.config_dict)
         c = self.i2
+        if 0 < _PASSES < c.passes:
+            c.passes = _PASSES
         self.num_hidden_layers = c.layers
         self.hidden_size = c.hidden
         self.head_dim = c.head_dim
@@ -437,9 +657,13 @@ class Inkling2LoopConfig(Config):
         # The loop as a layer map (a user-supplied map would break the pass structure)
         assert self.layer_map is None and self.layer_map_str is None, \
             "Inkling2Loop defines its own layer map (the loop passes); layer_map cannot be combined with it"
-        self.layer_map = [layer for layer, _ in c.applications]
         # Position of (layer, pass) in the forward order: the "visit" numbers a drafter's taps count
         self.app_index = {lp: n for n, lp in enumerate(c.applications)}
+        self.loopcd = LoopCD()
+        cd = LoopCD.from_env()
+        self.set_loopcd(cd.mode, cd.ref, cd.strength, cd.wmax)
+        # Control vector on the layer outputs (EXL3_I2_CVEC), or None
+        self.cvec = ControlVector.from_env(c)
 
         # The vision tower, when the model directory has its tensors: the "vision" component
         # (architecture/inkling2_vision.py)
@@ -471,6 +695,26 @@ class Inkling2LoopConfig(Config):
             from .inkling2_vision import Inkling2VisionModel
             self.model_classes["vision"] = Inkling2VisionModel
 
+    def set_loopcd(self, mode: str = "off", ref: int = 1, strength: float = 0.3, wmax: float = 0.0):
+        """
+        LoopCD settings (see LoopCD), to be called before the model is created: the layer map follows the mode.
+        In "logits" mode every layer after the loop is applied twice in a row: on the last pass's state
+        (instance 0, as without LoopCD) and then on the reference pass's state (instance 1, with its own cache
+        layers). The two readouts advance together, layer by layer, so they change GPU together: with all of
+        the reference readout after all of the other, a split inside these layers would send the state across
+        twice more per forward. The second applications are not counted in `app_index` / `i2.applications`.
+        """
+        c = self.i2
+        cd = LoopCD(mode, ref, strength, wmax)
+        if cd.mode != "off":
+            assert c.passes > 1, "LoopCD needs a loop with more than one pass"
+            assert 1 <= cd.ref < c.passes, f"LoopCD: the reference pass must be in 1..{c.passes - 1}"
+        self.loopcd = cd
+        self.layer_map = [layer for layer, _ in c.applications]
+        if cd.mode == "logits":
+            self.layer_map = self.layer_map[: len(self.layer_map) - (c.layers - c.loop_end)] + \
+                [layer for layer in range(c.loop_end, c.layers) for _ in range(2)]
+
     @override
     def default_max_position_embeddings(self):
         return 1048576
@@ -496,10 +740,15 @@ class _RowState:
     def __init__(self):
         self.blocks = None
         self.loop = I2.LoopState()
+        # LoopCD: (hidden, blocks) the reference pass left. In logits mode the layers after the loop work on two
+        # states in turn, the last pass's and the reference: this is the one that is waiting
+        self.ref = None
 
     def to(self, device):
         mv = lambda t: t if t is None or t.device == device else t.to(device)
         self.blocks = mv(self.blocks)
+        if self.ref is not None:
+            self.ref = (mv(self.ref[0]), mv(self.ref[1]))
         lp = self.loop
         if lp.pre is not None:
             lp.pre = (mv(lp.pre[0]), mv(lp.pre[1]))
@@ -731,7 +980,8 @@ class _DecodeGraph:
         # base_page < 0: the sequence's pages are not contiguous; the global layers gather them
         # width: tokens per step (1 when decoding, more for a pass that verifies drafted tokens)
         # taps: layer applications whose input a draft model reads (see _wants_tap)
-        self.key = (id(cache), slot, base_page, cap, width, taps)
+        cd = model.config.loopcd
+        self.key = (id(cache), slot, base_page, cap, width, taps, cd.mode, cd.ref)
         self.width = width
         self.taps = taps
         self.exports = []
@@ -795,6 +1045,8 @@ class _DecodeGraph:
                 lp.pre = (move(lp.pre[0]), move(lp.pre[1]))
             if lp.src is not None:
                 lp.src = (move(lp.src[0]), move(lp.src[1]))
+            if row.ref is not None:
+                row.ref = (move(row.ref[0]), move(row.ref[1]))
 
             def body(x):
                 for module, inst in seg["apps"]:
@@ -1008,11 +1260,50 @@ class Inkling2Layer(_I2Module):
         attn = c.hidden * (2 * c.heads * c.head_dim + 2 * c.kv_heads * c.head_dim + c.heads * (c.head_dim + c.d_rel + 1))
         return attn + c.experts * 3 * c.hidden * c.inter
 
+    def _loopcd_enter(self, st: _RowState, h: torch.Tensor, loop_pass: int) -> torch.Tensor:
+        """
+        LoopCD at the places where it touches the state between layer applications. h: [S, D], the hidden state
+        arriving at this application (st.blocks: the block states with it). Returns the hidden state the
+        application starts from.
+
+            first loop layer, pass `ref` (counted from 0)    h and st.blocks are what pass `ref` (counted from 1)
+                                                             left: kept as the reference state
+            first layer after the loop, hidden mode          h + w * (h - reference)
+            layers after the loop, logits mode               every application but the first swaps the arriving
+                                                             state with the waiting one: each layer runs on the
+                                                             last pass's state, then on the reference state. After
+                                                             the last one, the reference readout is the arriving
+                                                             state and the last pass's is waiting, for the head
+        """
+        cd = self.config.loopcd
+        cfg = self.config.i2
+        if self.layer_idx == cfg.loop_start:
+            if loop_pass == cd.ref:
+                st.ref = (h, st.blocks)
+        elif self.layer_idx >= cfg.loop_end:
+            if st.ref is None:
+                # Hidden mode after its first layer; or no pass went before this application: the loader's
+                # measuring forward runs every layer once
+                return h
+            if cd.mode == "hidden":
+                ref, st.ref = st.ref[0], None
+                hf = h.float()
+                # Only the direction of the result matters: the layers after the loop read it through RMS norms
+                return (hf + cd.ctl(self.device)[0] * (hf - ref.float())).to(h.dtype)
+            if self.layer_idx > cfg.loop_end or loop_pass == 1:
+                (h, st.blocks), st.ref = st.ref, (h, st.blocks)
+        return h
+
     @override
     def forward(self, x: torch.Tensor, params: dict, out_dtype: torch.dtype | None = None) -> torch.Tensor:
         cfg = self.config.i2
         adt = self.config.activation_dtype
         loop_pass = params.get("layer_instance", 0)
+        loopcd = self.config.loopcd.mode != "off"
+        cvec = self.config.cvec
+        if cvec is not None:
+            # The application's number; LoopCD's reference readout counts as the layer's application after the loop
+            app = self.config.app_index.get((self.layer_idx, loop_pass), self.config.app_index[(self.layer_idx, 0)])
         g = params.get("i2_graph")
         if g is not None:
             # One token of one sequence inside a CUDA graph (see _DecodeGraph)
@@ -1026,11 +1317,14 @@ class Inkling2Layer(_I2Module):
                 cache.get_recurrent_layer(key), g["slot"], ctl, cache.layers[key] if self.is_global else None,
                 g["base"], g["cap"], g["consts"][self.device],
             )
-            msgs = st.loop.enter(cfg, self.W, x[0], st.blocks, loop_pass, view.kops)
-            if _wants_tap(params, self.config.app_index[key]):
+            h = self._loopcd_enter(st, x[0], loop_pass) if loopcd else x[0]
+            msgs = st.loop.enter(cfg, self.W, h, st.blocks, loop_pass, view.kops)
+            if _wants_tap(params, self.config.app_index.get(key, -1)):
                 # A copy: the tensor has to stay valid as an output of the graph
                 _export_tap(params, st.loop.hidden.unsqueeze(0).clone())
             h, st.blocks = I2.layer_forward(self.W, self.ex, st.loop.hidden, st.loop.blocks, adt, view, ctl[0], msgs)
+            if cvec is not None:
+                h = cvec.apply(h, app)
             st.loop.hidden = st.loop.blocks = None
             st.loop.leave(cfg, self.W, loop_pass)
             return h.unsqueeze(0)
@@ -1051,7 +1345,8 @@ class Inkling2Layer(_I2Module):
             n = x.shape[1]
         if self.mlp is not None:
             self.ex.params = params
-        tap = _wants_tap(params, self.config.app_index[(self.layer_idx, loop_pass)])
+        # (the second application of a layer after the loop, LoopCD's reference readout, has no visit number)
+        tap = _wants_tap(params, self.config.app_index.get((self.layer_idx, loop_pass), -1))
         taps = []
         for b, st in enumerate(params["i2"]):
             st.to(self.device)
@@ -1064,12 +1359,14 @@ class Inkling2Layer(_I2Module):
                 # Every layer application drops the same pages from its sliding buffer; the state follows after
                 # the forward (SWAState.post_advance)
                 rs.wshift = ring_shift(cache_pos, n, self.kv_state_size)
-            msgs = st.loop.enter(cfg, self.W, x[b], st.blocks, loop_pass)
+            h = self._loopcd_enter(st, x[b], loop_pass) if loopcd else x[b]
+            msgs = st.loop.enter(cfg, self.W, h, st.blocks, loop_pass)
             if tap:
                 taps.append(st.loop.hidden)
-            out[b], st.blocks = I2.layer_forward(
+            h, st.blocks = I2.layer_forward(
                 self.W, self.ex, st.loop.hidden, st.loop.blocks, adt, view, pos0, msgs
             )
+            out[b] = h if cvec is None else cvec.apply(h, app)
             st.loop.hidden = st.loop.blocks = None
             st.loop.leave(cfg, self.W, loop_pass)
         if tap:
@@ -1081,7 +1378,9 @@ class Inkling2Layer(_I2Module):
             finals = []
             for b, st in enumerate(params["i2"]):
                 st.to(head.device)
-                finals.append(I2.final_hidden(head.Hd, out[b].to(head.device), st.blocks, adt))
+                # (LoopCD, logits mode: this is the reference readout; the last pass's state is the waiting one)
+                h, blocks = (out[b].to(head.device), st.blocks) if st.ref is None else st.ref
+                finals.append(I2.final_hidden(head.Hd, h, blocks, adt))
             _export_tap(params, torch.stack(finals))
         return out
 
@@ -1106,16 +1405,34 @@ class Inkling2Head(_I2Module):
     def forward(self, x: torch.Tensor, params: dict, out_dtype: torch.dtype | None = None) -> torch.Tensor:
         adt = self.config.activation_dtype
         n = x.shape[1]
-        out, finals = [], []
+        out, finals, pairs = [], [], []
+        g = params.get("i2_graph")
+        kops = None if g is None else g["consts"][self.device]["kops"]
         for b, st in enumerate(params["i2"]):
-            if "i2_graph" not in params:
+            if g is None:
                 st.to(self.device)
             # The forward loop may have cut the hidden state to the last tokens (last_tokens_only)
-            blocks = st.blocks[:, -n:]
-            g = params.get("i2_graph")
-            fin = I2.final_hidden(self.Hd, x[b], blocks, adt, None if g is None else g["consts"][self.device]["kops"])
+            h, blocks = x[b], st.blocks[:, -n:]
+            ref = None
+            if st.ref is not None:
+                # LoopCD, logits mode: x is the output of the layers after the loop for the reference pass; the
+                # last pass's is the waiting state (never cut)
+                ref = I2.final_hidden(self.Hd, h, blocks, adt, kops)
+                h, blocks = st.ref[0][-n:], st.ref[1][:, -n:]
+                st.ref = None
+            fin = I2.final_hidden(self.Hd, h, blocks, adt, kops)
             finals.append(fin)
-            out.append(I2.logits_from_hidden(self.Hd, fin))
+            if ref is None:
+                out.append(I2.logits_from_hidden(self.Hd, fin))
+                continue
+            # One product for both: the unembedding is read once
+            z = I2.logits_from_hidden(self.Hd, torch.cat([fin, ref], 0))
+            out.append(I2.loopcd_logits(z[:n], z[n:], self.config.loopcd.ctl(self.device)))
+            if params.get("loopcd_export"):
+                pairs.append((z[:n], z[n:]))
+        if pairs:
+            # For tests and offline sweeps of the strength: the two sets of logits, [bsz, seq, vocab] each
+            params["loopcd_logits"] = (torch.stack([p[0] for p in pairs]), torch.stack([p[1] for p in pairs]))
         if _wants_tap(params, len(self.config.i2.applications)):
             # The final normed hidden state: the tap after the last layer application
             _export_tap(params, torch.stack(finals).clone())
@@ -1170,7 +1487,9 @@ class Inkling2LoopModel(Model):
         return input_ids
 
     def active_devices_cuda(self):
-        return sorted({m.device for m in self.modules if m.device is not None and m.device.type == "cuda"}, key = str)
+        # (a device given to load() as a string stays one on the modules)
+        devices = {torch.device(m.device) for m in self.modules if m.device is not None}
+        return sorted((d for d in devices if d.type == "cuda"), key = str)
 
     @property
     def _graph_ok(self) -> bool:
@@ -1254,7 +1573,8 @@ class Inkling2LoopModel(Model):
         rs.wshift = shift
 
         taps = frozenset(params.get("export_state_layers") or ())
-        key = (id(cache), rs.slot, base_page, cap, width, taps)
+        cd = self.config.loopcd
+        key = (id(cache), rs.slot, base_page, cap, width, taps, cd.mode, cd.ref)
         try:
             graph = self._graphs.get(width)
             if graph is None or graph.key != key:
@@ -1317,10 +1637,35 @@ class Inkling2LoopModel(Model):
         advance_recurrent_states(input_ids, params, self)
         return y
 
+    def set_loopcd(self, mode: str | None = None, ref: int | None = None, strength: float | None = None,
+                   wmax: float | None = None):
+        """
+        Change the LoopCD settings of the loaded model. Strength and cap apply from the next forward. Mode and
+        reference pass can change between "off" and "hidden" (captured decode steps are rebuilt); "logits" has
+        its own cache layers, so the model is created with it or without (Inkling2LoopConfig.set_loopcd).
+        """
+        cd = self.config.loopcd
+        mode = cd.mode if mode is None else mode
+        ref = cd.ref if ref is None else int(ref)
+        if (mode, ref) != (cd.mode, cd.ref):
+            assert mode in LoopCD.MODES, f"LoopCD: mode must be one of {LoopCD.MODES}"
+            assert "logits" not in (mode, cd.mode), \
+                "LoopCD: logits mode and its reference pass are fixed when the model is created"
+            passes = self.config.i2.passes
+            assert mode == "off" or 1 <= ref < passes, f"LoopCD: the reference pass must be in 1..{passes - 1}"
+            for d in self.active_devices_cuda():
+                torch.cuda.synchronize(d)
+            self._graphs.clear()
+            cd.mode, cd.ref = mode, ref
+        cd.set_strength(strength, wmax)
+
     @override
     def unload(self):
         self._graphs.clear()
         self._graph_capable = None
+        self.config.loopcd._ctl.clear()
+        if self.config.cvec is not None:
+            self.config.cvec._dev.clear()
         super().unload()
 
     @override

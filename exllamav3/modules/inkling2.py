@@ -1010,6 +1010,28 @@ def final_hidden(Hd: HeadWeights, hidden, blocks, adt = torch.bfloat16, kops = N
     return rms_norm(x, Hd.norm, Hd.cfg.eps).to(adt)
 
 
+def control_vector(h: torch.Tensor, d: torch.Tensor, coef: torch.Tensor, add: bool = False) -> torch.Tensor:
+    """
+    A control vector on a layer's output h [S, D]. d: fp32 [D], coef: fp32 scalar tensor.
+    Projection (d of unit length): h - coef * (h . d) d; additive: h + coef * d. In fp32, returned in h's dtype.
+    """
+    hf = h.float()
+    if add:
+        return (hf + coef * d).to(h.dtype)
+    return torch.addcmul(hf, ((hf @ d) * -coef).unsqueeze(-1), d).to(h.dtype)
+
+
+def loopcd_logits(z: torch.Tensor, z_ref: torch.Tensor, ctl: torch.Tensor) -> torch.Tensor:
+    """
+    LoopCD in logit space (arXiv:2610.02185, eq. 3 and 4): z + w * (z - z_ref), per token. z: fp32 [S, V], the
+    logits of the last loop pass; z_ref: those of the reference pass. ctl: fp32 [2] = (fixed strength, adaptive
+    cap): w = ctl[0] + ctl[1] * (1 - (p1 - p2)), with p1 and p2 the two largest probabilities of softmax(z).
+    """
+    top = torch.softmax(z, dim = -1).topk(2, dim = -1).values
+    w = ctl[0] + ctl[1] * (1.0 - (top[:, :1] - top[:, 1:]))
+    return z + w * (z - z_ref)
+
+
 def logits_from_hidden(Hd: HeadWeights, h: torch.Tensor, chunk: int = 256) -> torch.Tensor:
     """h: [S, D] -> fp32 [S, unpadded vocab], soft-capped. In row chunks: the logits of a long sequence are large"""
     cap, V = Hd.cfg.final_cap, Hd.cfg.unpadded_vocab
