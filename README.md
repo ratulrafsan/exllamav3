@@ -643,7 +643,7 @@ The checks in `util/inkling2/` compare the port with the transformers reference 
 ### SenseNova Loop
 
 > [!NOTE]
-> This patch is not my work. It is a port of [turboderp-org/exllamav3#609](https://github.com/turboderp-org/exllamav3/pull/609) and of the branch [`sensenova-loop-mtp`](https://github.com/Maxrio9/exllamav3/tree/sensenova-loop-mtp), both by [Maxrio9](https://github.com/Maxrio9). The architecture, the loop-aware conversion, the fused router kernel, the tests and the quantized models are all theirs. When the pull request is in an ExLlamaV3 release, this patch goes away.
+> This patch is not my work. It is a port of [turboderp-org/exllamav3#609](https://github.com/turboderp-org/exllamav3/pull/609) and of the branch [`sensenova-loop-mtp`](https://github.com/Maxrio9/exllamav3/tree/sensenova-loop-mtp), both by [Maxrio9](https://github.com/Maxrio9). The architecture, the loop-aware conversion, the fused router kernel, the tests and the quantized models are all theirs. My additions are small: refer to [Additions in this fork](#additions-in-this-fork). When the pull request is in an ExLlamaV3 release, this patch goes away.
 
 #### Overview
 
@@ -668,6 +668,12 @@ For the design and the validation against the BF16 model, refer to the pull requ
 - **Base.** The source branches are on the upstream `dev` branch. This port is on `v1.6.7` plus the patches of this fork. The pull request applied without changes.
 - **GEMM autotune.** The branch `sensenova-loop-mtp` makes the EXL3 GEMM kernels use one tuned configuration for 1 to 8 rows. This port does not include that change. On the RTX 4090, the speed and the greedy output with MTP were the same with the change and without it, and the change has an effect on the kernel tuning of all other models.
 
+#### Additions in this fork
+
+- **Merge kernel.** After each attention and MLP block, the model mixes the two streams and adds the block output. This step was 6 PyTorch operations on FP32 tensors. It is now one Triton program for each token. The result has the same bits as the PyTorch form. The same switch, `EXL3_LOOP_ROUTER_TRITON=0`, selects the PyTorch form.
+- **Router kernel on the second GPU.** Triton launches a kernel on the current device of PyTorch. With the model on a GPU that is not the first one, the router kernel stopped with the error `no kernel image is available for execution on the device`. The two kernels now select the device of their tensors for the launch.
+- **Draft settings.** With 6 draft tokens and a dynamic draft length (confidence 0.4), the MTP draft model is slightly faster than with 4 fixed draft tokens. Refer to [Test results](#test-results-3).
+
 #### Requirements
 
 - A quantized model with the vision tower and the MTP head. The tests used the 6.0 bpw model from [Maxrio/SenseNova-Loop-9B-exl3](https://huggingface.co/Maxrio/SenseNova-Loop-9B-exl3) (each bit rate is on its own branch).
@@ -676,7 +682,7 @@ For the design and the validation against the BF16 model, refer to the pull requ
 
 #### Use with TabbyAPI
 
-TabbyAPI at commit `4728158` needs no changes. These settings are the important ones (they follow the [recipes](https://github.com/Maxrio9/sensenova-loop-9b-exl3-recipes) of the model author):
+TabbyAPI at commit `4728158` needs no changes. These settings are the important ones (they follow the [recipes](https://github.com/Maxrio9/sensenova-loop-9b-exl3-recipes) of the model author, with 6 draft tokens and a dynamic draft length in place of 4 fixed draft tokens):
 
 ```yaml
 model:
@@ -690,7 +696,8 @@ model:
   vision: true
 draft_model:
   draft_mode: mtp
-  draft_num_tokens: 4
+  draft_num_tokens: 6
+  dynamic_draft: true
   hybrid_draft_tokens: 7
   sparse_draft_head: 16384
 ```
@@ -703,19 +710,33 @@ These are the results on the RTX 4090 with the 6.0 bpw model. With a cache of 13
 
 Decode speed in T/s, greedy, in the Python API (`util/sensenova_loop/mtp_check.py`):
 
-| Prompt | No draft model | MTP draft model | Ratio |
+| Prompt | No draft model | MTP, 4 draft tokens | MTP, 6 draft tokens, dynamic |
 |---|---:|---:|---:|
-| Code | 60.0 | 150.7 | 2.51 |
-| Math, with thinking | 59.8 | 147.0 | 2.46 |
-| List | 59.8 | 119.6 | 2.00 |
-| Prose | 59.9 | 91.2 | 1.52 |
-| Edit of a code block | 60.3 | 119.1 | 1.97 |
+| Code | 61.1 | 151.7 | 156.9 |
+| Math, with thinking | 61.0 | 148.3 | 148.5 |
+| List | 61.0 | 122.9 | 120.5 |
+| Prose | 61.1 | 93.3 | 93.9 |
+| Edit of a code block | 61.5 | 125.5 | 149.1 |
+| Mean gain | | 2.10 | 2.19 |
+
+Other draft settings gave no gain: 3 or 8 draft tokens, a sparse head of 8,192 or 32,768 tokens, and no hybrid drafting. Without the sparse head, prose decreases from 93 to 70 T/s. An FP16 delta-net state is 3% faster, but one of the five outputs was then different from the output without the draft model.
+
+Effect of the merge kernel:
+
+| Measurement | Before | After |
+|---|---:|---:|
+| Prefill, chunk of 1,024 tokens at 2K context, Python API | 4,177 T/s | 4,615 T/s |
+| Prefill, prompt of 39,918 tokens, TabbyAPI | 3,141 T/s | 4,020 T/s |
+| Decode without draft model | 60.6 T/s | 61.6 T/s |
+
+Prefill in TabbyAPI for a prompt of 109,829 tokens is 2,993 T/s, and the code planted at 10% of the prompt is found. A chunk size of 2,048 or 8,192 tokens changes prefill by less than 3%.
+
+Decode without the draft model has little left to gain. One decode step is 16.2 ms, and the GPU is busy for 15.7 ms of it. The EXL3 weight kernels use 13.6 ms. They read each weight of the loop layers two times for each token, at approximately the memory bandwidth of the GPU. The router uses 1.4 ms (96 calls). `util/sensenova_loop/profile.py` shows the time for each part.
 
 - **Same output.** For all five prompts, the greedy output with the MTP draft model was the same as the output without it, token for token.
-- **Prefill.** Prefill was 2,240 T/s for a prompt of 6,034 tokens in the Python API and 3,141 T/s for a prompt of 39,918 tokens in TabbyAPI.
 - **Cache.** For three greedy answers (176, 200 and 66 tokens), one full forward pass gave the same tokens as the generator at all positions but one.
 - **Router kernel.** On 600 tokens, the logits with the Triton router and with the PyTorch router agree on the top token at 99.67% of the positions (KL 0.00037). The pull request reports the same size for the difference between two BF16 runs.
-- **TabbyAPI.** These tests gave correct results: an answer with thinking off, an answer with thinking on (the reasoning arrives in `reasoning_content`), a tool call, the answer after the tool result, a question about an image, and a code planted at 10% of a 39,918-token prompt. Decode in TabbyAPI was 151 T/s for code and 92 T/s for prose.
+- **TabbyAPI.** These tests gave correct results: an answer with thinking off, an answer with thinking on (the reasoning arrives in `reasoning_content`), a tool call, the answer after the tool result, a question about an image, and a code planted at 10% of a 39,918-token prompt. Decode in TabbyAPI was 153 T/s for code and 87 to 93 T/s for prose.
 - **Tests of the pull request.** The CPU tests pass (32 passed, 4 skipped because they need local model paths). The GPU tests of the router kernel pass with Triton 3.6 (37 passed).
 
 The first run of `mtp_check.py` after the port gave a lower gain (1.55 on average). The two runs after it gave the numbers in the table. I did not find the cause.
@@ -728,13 +749,14 @@ The scripts are in `util/sensenova_loop/`:
 |---|---|
 | `loop_check.py` | Compares the two routers, generates text, compares the generator with a full forward pass, and tests cache reuse, a long prompt and a batch. |
 | `mtp_check.py` | Compares greedy text and decode speed with the MTP draft model and without it. |
+| `profile.py` | Shows the time of each part of a decode step and of a prefill chunk. |
 | `tabby_test.py` | Tests a running TabbyAPI: thinking, a tool call, an image, speed and a long prompt. |
 
 #### Limits
 
 - **No conversion of my own.** I did not convert the model and did not compare this port with the BF16 model. For the quality of the quantized models, refer to the pull request and the model card.
-- **One GPU.** The tests ran on one GPU. A split over two GPUs was not tested.
-- **Context.** The longest tested prompt has 39,918 tokens. Quantized cache modes were not tested.
+- **One GPU.** The generation tests ran on one GPU. On the second GPU, only the two Triton kernels were tested. A split over two GPUs was not tested.
+- **Context.** The longest tested prompt has 109,829 tokens. Quantized cache modes were not tested.
 - **Control vectors.** The generic control vector patch does not reach the layers in the loop, because these layers have their own forward function.
 
 ### Control vectors
